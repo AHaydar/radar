@@ -1,0 +1,137 @@
+import Anthropic from '@anthropic-ai/sdk';
+import type { TurnContext } from '../aggregator/turn.js';
+import type { ClassifierResult } from './classifier.js';
+import {
+  PRE_ADVISORY_SYSTEM_PROMPT,
+  PRE_ADVISORY_USER_TEMPLATE,
+  POST_ADVISORY_SYSTEM_PROMPT,
+  POST_ADVISORY_USER_TEMPLATE,
+} from './prompts.js';
+import { withTimeout } from '../util/async.js';
+
+export interface AdvisoryResult {
+  text: string;
+  aligned?: boolean;  // only set for post-advisory
+}
+
+const ADVISORY_TIMEOUT_MS = 10000;
+
+const PRE_ADVISORY_FALLBACK: AdvisoryResult = { text: 'Advisory unavailable (timeout)' };
+const POST_ADVISORY_FALLBACK_TIMEOUT: AdvisoryResult = { text: 'Advisory unavailable (timeout)', aligned: undefined };
+const POST_ADVISORY_FALLBACK_ERROR: AdvisoryResult = { text: 'Advisory unavailable (error)', aligned: undefined };
+
+export class Advisor {
+  private readonly client: Anthropic;
+
+  constructor(apiKey?: string) {
+    this.client = new Anthropic({ apiKey: apiKey ?? process.env.ANTHROPIC_API_KEY });
+  }
+
+  // Pre-advisory: called when classifier score >= 0.6
+  async preAdvisory(prompt: string, classification: ClassifierResult): Promise<AdvisoryResult> {
+    const userMessage = PRE_ADVISORY_USER_TEMPLATE
+      .replace('{prompt}', prompt)
+      .replace('{score}', classification.score.toFixed(2))
+      .replace('{reason}', classification.reason);
+
+    const advisoryPromise = (async (): Promise<AdvisoryResult> => {
+      const message = await this.client.messages.create({
+        model: 'claude-sonnet-4-5',
+        max_tokens: 200,
+        system: PRE_ADVISORY_SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: userMessage }],
+      });
+
+      const content = message.content[0];
+      if (content.type !== 'text') {
+        return PRE_ADVISORY_FALLBACK;
+      }
+
+      return { text: content.text.trim() };
+    })();
+
+    return withTimeout(advisoryPromise, ADVISORY_TIMEOUT_MS, PRE_ADVISORY_FALLBACK);
+  }
+
+  // Post-advisory: called on turn complete
+  async postAdvisory(context: TurnContext): Promise<AdvisoryResult> {
+    const toolSummary = buildToolSummary(context);
+    const totalCost = `$${context.totalCostUsd.toFixed(3)}`;
+    const totalTokens = (context.totalInputTokens + context.totalOutputTokens).toLocaleString();
+
+    const userMessage = POST_ADVISORY_USER_TEMPLATE
+      .replace('{prompt}', context.prompt)
+      .replace('{toolSummary}', toolSummary)
+      .replace('{totalCost}', totalCost)
+      .replace('{totalTokens}', totalTokens);
+
+    const advisoryPromise = (async (): Promise<AdvisoryResult> => {
+      const message = await this.client.messages.create({
+        model: 'claude-sonnet-4-5',
+        max_tokens: 300,
+        system: POST_ADVISORY_SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: userMessage }],
+      });
+
+      const content = message.content[0];
+      if (content.type !== 'text') {
+        return POST_ADVISORY_FALLBACK_ERROR;
+      }
+
+      const text = content.text.trim();
+      const aligned = text.startsWith('✓') ? true : text.startsWith('✗') ? false : undefined;
+
+      return { text, aligned };
+    })();
+
+    return withTimeout(advisoryPromise, ADVISORY_TIMEOUT_MS, POST_ADVISORY_FALLBACK_TIMEOUT);
+  }
+}
+
+function buildToolSummary(context: TurnContext): string {
+  const parts: string[] = [];
+
+  // Group tool calls by name, tracking Bash separately
+  const toolCounts = new Map<string, number>();
+  const bashCommands: string[] = [];
+  let bashCallCount = 0;
+
+  for (const result of context.toolResults) {
+    if (result.toolName === 'Bash') {
+      bashCallCount++;
+      if (result.bashCommand) {
+        bashCommands.push(`'${result.bashCommand}'`);
+      }
+    } else {
+      toolCounts.set(result.toolName, (toolCounts.get(result.toolName) ?? 0) + 1);
+    }
+  }
+
+  // Add non-bash tools
+  for (const [toolName, count] of toolCounts.entries()) {
+    parts.push(count === 1 ? toolName : `${toolName} (${count} calls)`);
+  }
+
+  // Add bash summary
+  if (bashCallCount > 0) {
+    if (bashCommands.length > 0) {
+      const bashLabel = bashCommands.length <= 3
+        ? `Bash: ${bashCommands.join(', ')}`
+        : `Bash: ${bashCommands.slice(0, 3).join(', ')} +${bashCommands.length - 3} more`;
+      parts.push(bashLabel);
+    } else {
+      parts.push(`Bash (${bashCallCount} calls)`);
+    }
+  }
+
+  // Token and cost summary
+  const totalTokens = context.totalInputTokens + context.totalOutputTokens;
+  if (totalTokens > 0) {
+    parts.push(`${totalTokens.toLocaleString()} tokens`);
+  }
+  if (context.totalCostUsd > 0) {
+    parts.push(`$${context.totalCostUsd.toFixed(3)}`);
+  }
+
+  return parts.join(' · ') || 'No tools used';
+}

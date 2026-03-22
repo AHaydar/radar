@@ -1,9 +1,0 @@
-{
-  "name": "radar",
-  "version": "0.1.0",
-  "description": "Ambiguity detection for Claude Code — catches vague prompts before Claude misinterprets them.",
-  "author": {
-    "name": "ahaydar"
-  },
-  "keywords": ["ambiguity", "safety", "advisory", "hooks"]
-}

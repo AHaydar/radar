@@ -1,0 +1,80 @@
+import Anthropic from '@anthropic-ai/sdk';
+import { CLASSIFIER_SYSTEM_PROMPT } from './prompts.js';
+import { withTimeout } from '../util/async.js';
+
+export interface ClassifierResult {
+  score: number;   // 0.0 – 1.0
+  reason: string;
+}
+
+const CLASSIFIER_TIMEOUT_MS = 3000;
+const CLASSIFIER_FALLBACK: ClassifierResult = {
+  score: 0.5,
+  reason: 'Classification timed out',
+};
+
+export class Classifier {
+  private readonly client: Anthropic;
+
+  constructor(apiKey?: string) {
+    this.client = new Anthropic({ apiKey: apiKey ?? process.env.ANTHROPIC_API_KEY });
+  }
+
+  async classify(prompt: string): Promise<ClassifierResult> {
+    const classifyPromise = (async (): Promise<ClassifierResult> => {
+      const message = await this.client.messages.create({
+        model: 'claude-haiku-4-5',
+        max_tokens: 100,
+        system: CLASSIFIER_SYSTEM_PROMPT,
+        messages: [
+          {
+            role: 'user',
+            content: `User prompt to classify:\n${prompt}`,
+          },
+        ],
+      });
+
+      const content = message.content[0];
+      if (content.type !== 'text') {
+        return CLASSIFIER_FALLBACK;
+      }
+
+      return parseClassifierResponse(content.text);
+    })();
+
+    return withTimeout(classifyPromise, CLASSIFIER_TIMEOUT_MS, CLASSIFIER_FALLBACK);
+  }
+}
+
+function parseClassifierResponse(raw: string): ClassifierResult {
+  try {
+    // Extract JSON — handle cases where the model wraps it in markdown code blocks
+    const jsonMatch = raw.match(/\{[^{}]*\}/);
+    if (!jsonMatch) {
+      return CLASSIFIER_FALLBACK;
+    }
+
+    const parsed = JSON.parse(jsonMatch[0]) as unknown;
+
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      !('score' in parsed) ||
+      !('reason' in parsed)
+    ) {
+      return CLASSIFIER_FALLBACK;
+    }
+
+    const obj = parsed as Record<string, unknown>;
+    const score = Number(obj.score);
+    const reason = String(obj.reason);
+
+    if (isNaN(score) || score < 0 || score > 1) {
+      return CLASSIFIER_FALLBACK;
+    }
+
+    return { score, reason };
+  } catch {
+    return CLASSIFIER_FALLBACK;
+  }
+}

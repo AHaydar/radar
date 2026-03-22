@@ -2,173 +2,59 @@
 
 ---
 
-## Phase 1: Radar Lite
+## Design Decision: Why OTel, Not Hooks
 
-**Goal:** Validate that ambiguity detection prompts work. Ship in one session. Zero infrastructure.
+Radar v1 used Claude Code's prompt hooks (`UserPromptSubmit` + `Stop`) to intercept prompts and responses. After two days of testing, this approach proved brittle:
 
-**Deliverable:** A Claude Code plugin — installable from a git repo.
+1. **Prompt hooks are synchronous.** Every prompt — including "yes", "continue", "looks good" — blocked while Haiku evaluated. The mechanism was wrong for a problem that affects ~1 in 10 prompts.
+2. **LLM-generated JSON is unreliable.** The Stop hook required Haiku to produce valid JSON under tight timeouts. One stray token → error. This is a reliability ceiling, not a prompt engineering problem.
+3. **No visibility.** Advisories went to Claude (post-hook feedback) or appeared as block messages (pre-hook). The developer never saw the analysis directly.
 
----
+Claude Code supports OpenTelemetry (OTel) event export — structured, non-blocking telemetry emitted in the background. This gives us the data we need without the hook machinery.
 
-### 1.1 Plugin Structure
+### Landscape: What Radar Does NOT Do
 
-```
-radar/
-├── .claude-plugin/
-│   ├── plugin.json          # Plugin metadata (name, version, description)
-│   └── marketplace.json     # Marketplace catalog — registers this repo as a plugin source
-├── hooks/
-│   └── hooks.json           # Hook definitions — auto-registered by Claude Code on install
-├── skills/
-│   └── radar/
-│       └── SKILL.md         # User-facing skill — explains warnings, tuning
-├── README.md
-├── PRD-v1.md
-└── ARCHITECTURE.md
-```
+Observability tools already exist for Claude Code:
 
-**`.claude-plugin/plugin.json`** — Declares the plugin to Claude Code. Name, version, author, keywords. No runtime code.
+- **[Claude Hindsight](https://github.com/Codestz/claude-hindsight)** — JSONL transcript parser, web dashboard, 3D execution graphs, cost tracking, session replay. Rust + React.
+- **[TMA1](https://tma1.ai/)** — OTel-based observability, cost/latency monitoring, security anomaly detection, SQL query interface. Single binary.
 
-**`.claude-plugin/marketplace.json`** — Marketplace catalog that registers this repo as a plugin source. Required for `/plugin marketplace add` to work. Lists the `radar` plugin with its source path, description, and metadata.
+Radar does not compete with these. It does not track costs, visualize sessions, or provide dashboards. Radar's scope is **intent analysis** — the one thing neither tool does:
 
-**`hooks/hooks.json`** — Contains the two prompt hooks (UserPromptSubmit + Stop). Claude Code registers these automatically when the plugin is installed. The developer never edits their `settings.json` directly.
+| Tool | Question it answers |
+|---|---|
+| Hindsight | "What happened in this session?" |
+| TMA1 | "How much did it cost? Was anything suspicious?" |
+| **Radar** | **"Did Claude understand what I meant?"** |
 
-**`skills/radar/SKILL.md`** — Exposes a `/radar` skill to the user. When the developer asks about a warning or wants to understand what Radar does, Claude reads this file.
-
-### 1.2 Installation
-
-```bash
-# Add the marketplace (registers the catalog)
-/plugin marketplace add /path/to/radar    # local
-/plugin marketplace add ahaydar/radar     # from GitHub
-
-# Install the plugin
-/plugin install radar@radar
-
-# Uninstall
-/plugin uninstall radar@radar
-```
-
-No npm package, no build step, no API key setup. The plugin system handles hook registration.
-
-### 1.3 Hook Configuration
-
-Defined in `hooks/hooks.json` (not the user's settings.json):
-
-- **UserPromptSubmit:** `prompt` hook, model `"haiku"`, 10s timeout — scores ambiguity, blocks if risky
-- **Stop:** `prompt` hook, model `"haiku"`, 15s timeout — checks response alignment, blocks if misaligned
-
-Model aliases like `"haiku"` are preferred — they automatically resolve to the latest version.
-
-**Output format (per Claude Code hook protocol):**
-- **Allow (proceed):** Return empty JSON `{}` or no output. Claude proceeds normally.
-- **Block (with feedback):** Return `{ "decision": "block", "reason": "..." }`. The reason is shown to the developer (pre) or fed back to Claude (post).
-
-**Constraint:** Prompt hooks are synchronous by design — they cannot use `"async": true` (only command hooks support that). Every prompt submission and stop event blocks until Haiku responds. Haiku typically responds in <1s; the 10-15s timeouts are safety bounds.
-
-See `hooks/hooks.json` for the full prompt text.
-
-### 1.4 How It Works
-
-**Pre-advisory (UserPromptSubmit):**
-1. Developer types a prompt and hits enter
-2. Claude Code fires the prompt hook. `$ARGUMENTS` contains:
-   ```json
-   {
-     "session_id": "...",
-     "transcript_path": "/path/to/session.jsonl",
-     "cwd": "/Users/.../project",
-     "hook_event_name": "UserPromptSubmit",
-     "prompt": "clean up this module"
-   }
-   ```
-3. Haiku evaluates ambiguity risk
-4. If low risk → returns `{}` → Claude proceeds normally, developer notices nothing
-5. If high risk → returns `{ "decision": "block", "reason": "..." }` → Developer sees the reason as a block message. They can rephrase and resubmit.
-
-**Post-advisory (Stop):**
-1. Claude finishes its full response (all tool calls complete)
-2. Claude Code fires the prompt hook. `$ARGUMENTS` contains:
-   ```json
-   {
-     "session_id": "...",
-     "transcript_path": "/path/to/session.jsonl",
-     "cwd": "/Users/.../project",
-     "hook_event_name": "Stop",
-     "stop_hook_active": false,
-     "last_assistant_message": "I've completed the refactoring..."
-   }
-   ```
-3. Haiku evaluates whether the response (`last_assistant_message`) matched the developer's likely intent
-4. If `stop_hook_active` is `true` → returns `{}` immediately (prevents infinite loops)
-5. If aligned → returns `{}` → Turn ends normally
-6. If misaligned → returns `{ "decision": "block", "reason": "..." }` → Hook blocks the stop. The reason is fed back to Claude. Claude may self-correct or surface the feedback.
-
-### 1.5 Known Limitations to Observe
-
-Track these during use — they become the requirements for Phase 2:
-
-| # | Limitation | What to watch for |
-|---|---|---|
-| L1 | Developer doesn't see post-advisory directly | Does Claude surface the feedback? Or does it silently adjust? Is that good or bad? |
-| L2 | Prompt hooks are synchronous (hard constraint — cannot be async). Pre-hook blocks Claude on every prompt. | Is the ~200ms Haiku pause noticeable? Does blocking feel helpful or annoying? |
-| L3 | Haiku-only (no Sonnet escalation) | Are Haiku's assessments good enough? Where does it miss? |
-| L4 | Pre-hook has no prior session context (only the current prompt). Post-hook has `last_assistant_message` but the prompt hook can't read `transcript_path`. | Is current-prompt-only enough for pre-advisory? Is `last_assistant_message` enough for post-advisory, or do we need full session history? |
-| L5 | Post-hook may cause loops | Does `stop_hook_active` reliably prevent infinite continues? |
-| L6 | No visibility into what Radar flagged | Useful advisories are invisible unless you remember them |
-
-### 1.6 Prompt Tuning
-
-The prompts above are v1. Expect to iterate. Key tuning dimensions:
-
-- **Sensitivity:** "Be conservative" controls false positive rate. If too noisy, add "Only flag if you are >80% confident Claude will misinterpret."
-- **Output format:** The `reason` string is all the developer sees. Keep it tight: warning + suggested clarification.
-- **Scope creep detection:** The most common failure mode. Consider adding explicit examples to the prompt.
-
-### 1.7 Implementation Steps
-
-| Step | Action | Time | Status |
-|---|---|---|---|
-| 1 | Create `.claude-plugin/plugin.json` with metadata | 5 min | — |
-| 2 | Create `.claude-plugin/marketplace.json` with catalog | 5 min | — |
-| 3 | Create `hooks/hooks.json` with prompt hook definitions (including prompt text) | 30 min | — |
-| 4 | Create `skills/radar/SKILL.md` with user-facing docs | 15 min | — |
-| 5 | Install plugin locally: `/plugin marketplace add` + `/plugin install radar@radar` | 5 min | — |
-| 6 | Test with 5 known-ambiguous prompts from the PRD examples | 30 min | — |
-| 7 | Test with 5 clear prompts (should NOT trigger) | 15 min | — |
-| 8 | Tune prompts based on results | 30 min | — |
-| 9 | Use normally for 2-3 sessions, note pain points | 1-2 days | — |
-| 10 | Document findings, feeds Phase 2 requirements | 30 min | — |
+A developer can run all three. They complement, not compete.
 
 ---
 
-## Phase 2: Radar Full
+## Architecture
 
-**Goal:** Separate pane, non-blocking, two-tier model (Haiku → Sonnet), full session context.
+**Goal:** Non-blocking, real-time ambiguity detection and intent alignment checking for Claude Code prompts, powered by OTel events.
 
-**Deliverable:** npm package `radar-cc` with CLI.
+**Deliverable:** npm package `radar-cc` with a `radar watch` CLI command.
 
 ---
 
-### 2.1 Project Structure
+### Project Structure
 
 ```
 radar/
 ├── src/
 │   ├── cli/
-│   │   ├── index.ts              # CLI entry point (commander)
-│   │   ├── install.ts            # radar install — writes hooks + validates env
-│   │   ├── uninstall.ts          # radar uninstall — removes hooks
-│   │   └── watch.ts              # radar watch — long-running observer process
-│   ├── hooks/
-│   │   ├── pre.ts                # radar hook pre — thin dispatcher
-│   │   └── post.ts               # radar hook post — thin dispatcher
+│   │   ├── index.ts              # CLI entry (commander)
+│   │   └── watch.ts              # radar watch — OTLP receiver + analyzer
+│   ├── receiver/
+│   │   └── otlp.ts               # Lightweight OTLP HTTP server (receives log exports)
+│   ├── aggregator/
+│   │   └── turn.ts               # Groups events by prompt.id, detects turn boundaries
 │   ├── analysis/
 │   │   ├── classifier.ts         # Tier 1: Haiku ambiguity scorer
 │   │   ├── advisor.ts            # Tier 2: Sonnet advisory (pre + post modes)
 │   │   └── prompts.ts            # All LLM prompt templates
-│   ├── context/
-│   │   └── reader.ts             # JSONL session reader + truncator
 │   └── output/
 │       └── formatter.ts          # Terminal output — colors, boxes, timestamps
 ├── package.json
@@ -177,113 +63,158 @@ radar/
 └── ARCHITECTURE.md
 ```
 
-### 2.2 Component Design
+### How It Works
 
-#### 2.2.1 Hook Dispatchers (`src/hooks/`)
-
-Thin scripts invoked by Claude Code. Their only job: write an event file and exit.
-
-**`radar hook pre`** (called by UserPromptSubmit):
 ```
-stdin → { session_id, transcript_path, cwd, hook_event_name, prompt }
-action → write /tmp/radar/events/pre-<timestamp>.json
-stdout → nothing
-exit   → 0 (always — never block Claude)
-```
-
-**`radar hook post`** (called by Stop):
-```
-stdin → { session_id, transcript_path, cwd, hook_event_name, stop_hook_active, last_assistant_message }
-action → if stop_hook_active, exit 0 (prevent loops)
-         else write /tmp/radar/events/post-<timestamp>.json
-stdout → nothing
-exit   → 0 (always)
+┌──────────────────────┐       OTLP HTTP/JSON        ┌───────────────────┐
+│    Claude Code       │ ─────────────────────────── │   radar watch     │
+│                      │   user_prompt events         │   (Node.js)       │
+│  Env vars:           │   tool_result events         │                   │
+│  OTEL_LOGS_EXPORTER  │   api_request events         │  ┌─ OTLP receiver │
+│  = otlp              │                              │  ├─ aggregator    │
+│  OTEL_LOG_USER_      │                              │  ├─ classifier    │
+│  PROMPTS = 1         │                              │  ├─ advisor       │
+│                      │                              │  └─ formatter     │
+└──────────────────────┘                              └───────────────────┘
+        Main pane                                          Radar pane
 ```
 
-Event file format:
-```json
-{
-  "type": "pre",
-  "timestamp": 1710590400000,
-  "session_id": "abc123",
-  "transcript_path": "/path/to/session.jsonl",
-  "cwd": "/Users/ali/workspace/project",
-  "prompt": "clean up this module"
-}
+### Event Flow
+
+| Step | Main pane (Claude Code) | Radar pane (`radar watch`) |
+|---|---|---|
+| 1 | Developer sends prompt | — |
+| 2 | Claude Code emits `user_prompt` event via OTLP | OTLP receiver gets event within ~2s |
+| 3 | Claude starts processing immediately (never blocked) | Haiku classifier scores prompt ambiguity |
+| 4 | Claude calls tools (Edit, Bash, etc.) | If score ≥ 0.6 → Sonnet pre-advisory printed |
+| 5 | Claude makes API requests | `tool_result` + `api_request` events accumulate, grouped by `prompt.id` |
+| 6 | Claude finishes turn | No new events for ~5s → turn boundary detected |
+| 7 | Developer reads response | Post-advisory: Sonnet analyzes accumulated tool activity vs original prompt intent |
+
+### OTel Events Used
+
+Claude Code emits these events when `OTEL_LOGS_EXPORTER=otlp` is configured:
+
+| Event | Key Attributes | Radar Use |
+|---|---|---|
+| `claude_code.user_prompt` | `prompt` (requires `OTEL_LOG_USER_PROMPTS=1`), `prompt_length`, `prompt.id` | Pre-advisory trigger + input |
+| `claude_code.tool_result` | `tool_name`, `success`, `duration_ms`, `tool_parameters` (includes bash commands), `tool_result_size_bytes` | Post-advisory: what Claude *did* |
+| `claude_code.api_request` | `model`, `cost_usd`, `input_tokens`, `output_tokens`, `duration_ms` | Post-advisory: cost/effort context |
+| `claude_code.api_error` | `error`, `status_code` | Error awareness |
+
+**`prompt.id`** is the critical correlation key — a UUID that links all events from a single user prompt. Every tool call, API request, and error shares the same `prompt.id`.
+
+**What OTel does NOT include:** Claude's response text. We get tool results and metadata, but not `last_assistant_message`. Post-advisory is based on *what Claude did* (tools used, files edited, commands run, tokens spent) rather than *what Claude said*. This is often more actionable.
+
+---
+
+### Setup
+
+Environment variables (can be set in shell profile or `.claude/settings.json` `env` block):
+
+```bash
+export CLAUDE_CODE_ENABLE_TELEMETRY=1
+export OTEL_LOGS_EXPORTER=otlp
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/json
+export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://localhost:4820/v1/logs
+export OTEL_LOG_USER_PROMPTS=1
+export OTEL_LOG_TOOL_DETAILS=1
+export OTEL_LOGS_EXPORT_INTERVAL=2000    # 2s for faster advisories (default: 5s)
 ```
 
-#### 2.2.2 Context Reader (`src/context/`)
+Usage:
 
-Reads and parses the active Claude Code session JSONL.
+```bash
+npm install -g radar-cc
+radar watch    # start in a second terminal pane
+# then start Claude Code normally — telemetry flows automatically
+```
 
-**Inputs:** `transcript_path` (provided directly by Claude Code in hook input — no need to guess the path)
-**Outputs:**
-- `getSessionContext(transcriptPath, maxTurns)` → truncated session as string
-- `getLatestPrompt(transcriptPath)` → the user's most recent message
-- `getLatestResponse(transcriptPath)` → Claude's most recent full response (text + tool calls summarised)
+No hooks to merge, no settings.json hook modifications, no plugin system required.
 
-**JSONL location:** Provided via `transcript_path` field in hook input (e.g. `~/.claude/projects/<project-hash>/<session_id>.jsonl`)
+---
 
-**Truncation:** Last 20 turns by default. A turn = user message + assistant response + tool calls.
+### Component Design
 
-**Error handling:** Skip unparseable lines. If file not found, return empty context with a warning.
+#### OTLP Receiver (`src/receiver/otlp.ts`)
 
-#### 2.2.3 Classifier (`src/analysis/classifier.ts`)
+Lightweight HTTP server on `localhost:4820`.
+
+- Accepts `POST /v1/logs` (OTLP JSON format)
+- Parses OTel `LogRecord` objects → extracts event name + attributes
+- Emits typed events to the aggregator
+- Returns `200 OK` immediately (never blocks Claude Code's export)
+
+Implementation: Node.js built-in `http` module. No OTel SDK dependency needed on the receiver side — we're just parsing JSON.
+
+#### Turn Aggregator (`src/aggregator/turn.ts`)
+
+Groups events by `prompt.id` and detects turn boundaries.
+
+Maintains a `Map<promptId, TurnContext>` where `TurnContext` accumulates:
+- The user prompt text (from `user_prompt` event)
+- List of tool results: tool name, success, duration, bash command if applicable
+- API request summaries: model, cost, tokens
+- Any errors
+
+**Turn boundary detection:** No new events for the same `prompt.id` for N seconds (configurable, default 5s) → turn is complete → triggers post-advisory.
+
+**Cleanup:** Removes completed turns after 5 minutes to prevent memory growth.
+
+#### Classifier (`src/analysis/classifier.ts`)
 
 **Model:** Haiku
-**Input:** User prompt + last 3 turns of context
+**Input:** User prompt text (from `user_prompt` event attribute)
 **Output:** `{ score: number, reason: string }`
 **Timeout:** 3 seconds, fallback to score 0.5
 **Cost:** ~$0.001 per call
 
-#### 2.2.4 Advisor (`src/analysis/advisor.ts`)
+Same ambiguity detection logic from the hook-based approach — the prompt is proven, only the delivery mechanism changed.
+
+#### Advisor (`src/analysis/advisor.ts`)
 
 **Model:** Sonnet
 **Two modes:**
 
-Pre-advisory input:
-- Full session context (truncated)
-- Current user prompt
-- Classifier score + reason
-
-Pre-advisory output:
-- Most likely misinterpretation
-- Scope risk
-- One clarifying question
+**Pre-advisory** (triggered when classifier score ≥ 0.6):
+- Input: user prompt + classifier score + reason
+- Output: most likely misinterpretation, scope risk, one clarifying question
 - Max 4 lines
 
-Post-advisory input:
-- Full session context (truncated)
-- User prompt
-- Claude's response summary
-
-Post-advisory output:
-- Alignment assessment
-- If misaligned: what went wrong + exact re-prompt
+**Post-advisory** (triggered on turn boundary):
+- Input: user prompt + accumulated `TurnContext` (tools used, files edited, bash commands run, cost, token count)
+- Output: alignment assessment. If misaligned: what went wrong + exact re-prompt suggestion
 - Max 5 lines
 
 **Timeout:** 10 seconds
 **Cost:** ~$0.005–0.01 per call
 
-#### 2.2.5 Watch Process (`src/cli/watch.ts`)
+#### Watch Process (`src/cli/watch.ts`)
 
-Long-running process. Developer runs `radar watch` in a second terminal.
+Wires everything together. Developer runs `radar watch` in a second terminal.
+
+**Startup:**
+1. Start OTLP HTTP server on `localhost:4820`
+2. Print status: "Radar listening on :4820 — waiting for Claude Code events..."
+3. Warn if first events arrive without prompt content (developer forgot `OTEL_LOG_USER_PROMPTS=1`)
 
 **Event loop:**
-1. `fs.watch` on `/tmp/radar/events/`
-2. On pre-event:
-   - Read event JSON
+1. OTLP receiver parses incoming log exports
+2. On `user_prompt` event:
+   - Create new `TurnContext` for this `prompt.id`
    - Run classifier (Haiku)
    - If score < 0.6 → print one-line clear message (dim)
-   - If score ≥ 0.6 → read session context, run advisor (Sonnet), print full advisory
-3. On post-event:
-   - Read event JSON
-   - Read session JSONL for Claude's response
-   - Run advisor in post mode (Sonnet)
+   - If score ≥ 0.6 → run advisor (Sonnet) → print full pre-advisory
+3. On `tool_result` / `api_request` / `api_error` events:
+   - Append to existing `TurnContext` for this `prompt.id`
+4. On turn boundary (no new events for N seconds):
+   - Run advisor in post mode (Sonnet) with full `TurnContext`
    - Print post-advisory
-4. Delete processed event files
 
-**Output format:**
+#### Formatter (`src/output/formatter.ts`)
+
+Terminal output formatting.
+
 ```
 ── PRE ── 14:23:07 ── score: 0.34 ── ✓ Clear ─────
 
@@ -297,11 +228,12 @@ Long-running process. Developer runs `radar watch` in a second terminal.
 
 ── POST ── 14:25:38 ────────────────────────────────
 ✓ Response aligned with intent.
+  Tools: Edit (2 files) · 847 tokens · $0.003
 ────────────────────────────────────────────────────
 
 ── POST ── 14:31:02 ────────────────────────────────
 ✗ Scope exceeded likely intent.
-  Claude rewrote the entire test suite (142 lines changed).
+  Claude ran Edit on 5 files, Bash (3 commands), 12k tokens, $0.08.
   Developer likely wanted: coverage for 2 new edge cases only.
   → "undo all changes. add test cases for the null input
     and timeout edge cases in processOrder — nothing else"
@@ -314,53 +246,17 @@ Long-running process. Developer runs `radar watch` in a second terminal.
 - Red: post-mismatch
 - Dim grey: suppressed / low-score clears
 
-#### 2.2.6 Install CLI (`src/cli/install.ts`)
+---
 
-**`radar install`:**
-1. Validate `ANTHROPIC_API_KEY` is set
-2. Read existing `~/.claude/settings.json`
-3. Merge Radar hook config (preserve existing hooks)
-4. Create `/tmp/radar/events/` directory
-5. Print: "✓ Hooks installed. Run `radar watch` in a second terminal."
+### Model Strategy
 
-**`radar uninstall`:**
-1. Remove Radar hooks from settings.json
-2. Clean up `/tmp/radar/`
+| Pre-advisory | Post-advisory |
+|---|---|
+| Haiku classify → Sonnet advise (when score ≥ 0.6) | Sonnet always (uses accumulated TurnContext) |
 
-### 2.3 Hook Configuration (written by `radar install`)
+---
 
-```json
-{
-  "hooks": {
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "radar hook pre",
-            "async": true,
-            "timeout": 5
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "radar hook post",
-            "async": true,
-            "timeout": 5
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-### 2.4 Dependencies
+### Dependencies
 
 | Package | Purpose | Dev/Prod |
 |---|---|---|
@@ -369,67 +265,88 @@ Long-running process. Developer runs `radar watch` in a second terminal.
 | `typescript` | Type safety | dev |
 | `tsup` | Bundling | dev |
 
-No other dependencies. Deliberately minimal.
+No OTel SDK needed. The OTLP receiver is a plain HTTP server parsing JSON — Node.js built-in `http` module is sufficient. Deliberately minimal.
 
-### 2.5 Implementation Order
+---
+
+### Implementation Order
 
 ```
 Step 1: Scaffold (package.json, tsconfig, tsup config, CLI skeleton)
         │
-        ├── Step 2: Hook dispatchers (pre.ts, post.ts)
-        │           No dependencies. Test: stdin → event file written.
+        ├── Step 2: OTLP receiver (otlp.ts)
+        │           HTTP server, parse LogRecord JSON, emit typed events.
+        │           Test: POST sample OTel payload → events emitted correctly.
         │
-        ├── Step 3: Context reader (reader.ts)
-        │           No dependencies. Test: parse sample JSONL → structured output.
+        ├── Step 3: Turn aggregator (turn.ts)
+        │           Group by prompt.id, detect turn boundaries.
+        │           Test: feed sequence of events → TurnContext built correctly.
         │
-        └── Step 4: Install CLI (install.ts)
-                    Depends on knowing hook config shape (defined above).
-                    Test: settings.json correctly merged.
+        └── Step 4: Formatter (formatter.ts)
+                    Terminal output formatting.
+                    Test: format sample advisory → matches expected output.
 
 Step 5: Classifier (classifier.ts)
-        Depends on: Anthropic SDK setup
-        Test: known-ambiguous prompts score > 0.6, clear prompts < 0.4
+        Depends on: Anthropic SDK setup.
+        Test: known-ambiguous prompts score > 0.6, clear prompts < 0.4.
 
 Step 6: Advisor (advisor.ts, prompts.ts)
-        Depends on: context reader (Step 3), Anthropic SDK
-        Test: pre-advisory on ambiguous prompt produces actionable output
+        Depends on: Anthropic SDK.
+        Post-advisory prompt uses TurnContext (tools, cost, tokens) not last_assistant_message.
+        Test: pre-advisory on ambiguous prompt produces actionable output.
 
-Step 7: Watch process (watch.ts, formatter.ts)
-        Depends on: all above
-        Integration: hooks write events → watch picks up → analysis → formatted output
+Step 7: Watch process (watch.ts)
+        Wires: receiver → aggregator → classifier/advisor → formatter.
+        Integration: start Claude Code with OTel env vars + radar watch side by side.
 ```
 
 Steps 2, 3, and 4 can be built in parallel.
 
-### 2.6 Testing Strategy
+---
+
+### Testing Strategy
 
 | Layer | How |
 |---|---|
-| Hook dispatchers | Unit test: mock stdin, verify event file contents |
-| Context reader | Unit test: parse fixture JSONL files (capture a real session) |
+| OTLP receiver | Unit test: POST sample OTel JSON payload, verify events parsed correctly |
+| Turn aggregator | Unit test: feed sequence of events with same/different prompt.id, verify grouping and boundary detection |
 | Classifier | Integration test: call Haiku with PRD example prompts, assert score ranges |
-| Advisor | Integration test: call Sonnet with fixture context, assert advisory format |
-| Watch process | Manual end-to-end: run Claude Code + radar watch side by side |
-
-### 2.7 Risks
-
-| Risk | Severity | Mitigation |
-|---|---|---|
-| JSONL format undocumented, may change | Medium | Resilient parser — skip unknown types, don't crash |
-| Event file race conditions | Low | Atomic writes (write .tmp, rename) |
-| `fs.watch` unreliable on some OS/FS combos | Medium | Fallback to polling (100ms interval) if watch fails |
-| Session JSONL path provided but format undocumented | Medium | `transcript_path` is provided in hook input — no path guessing needed, but JSONL schema may change |
-| Cost creep with Sonnet on every post | Low | Log cumulative cost in watch output, add threshold flag later |
+| Advisor | Integration test: call Sonnet with fixture TurnContext, assert advisory format |
+| Formatter | Unit test: format sample advisories, verify output structure and colors |
+| Watch process | Manual end-to-end: run Claude Code with OTel env vars + radar watch side by side |
 
 ---
 
-## Transition: Lite → Full
+### Risks
 
-After 2–3 days of using Lite, document:
+| Risk | Severity | Mitigation |
+|---|---|---|
+| OTel export format may change between Claude Code versions | Low | Standard OTLP protocol — unlikely to break. Resilient parser — skip unknown fields |
+| `OTEL_LOG_USER_PROMPTS` not enabled — only prompt length, no content | Medium | `radar watch` warns on startup if events arrive without prompt text |
+| Export interval adds latency — pre-advisory arrives ~2-5s after prompt, after Claude has started | Low | Advisory-only, not blocking — timing is acceptable. Reduce interval to 2s with `OTEL_LOGS_EXPORT_INTERVAL=2000` |
+| No access to Claude's response text — post-advisory based on tool activity only | Medium | Tool activity (files edited, commands run, cost) is often more actionable than response text. Can add optional JSONL reading later if needed |
+| Cost creep with Sonnet on every post-advisory | Low | Log cumulative cost in watch output, add threshold flag later |
+| Port conflict on 4820 | Low | Make port configurable via `--port` flag |
 
-1. **Detection quality:** Which prompts did Haiku correctly flag? Which did it miss? Which were false positives?
-2. **UX pain points:** Was blocking annoying? Did post-feedback to Claude actually help? Did you want to SEE the advisory?
-3. **Context sufficiency:** Was `last_assistant_message` enough for post-analysis, or did you wish Radar had full session history via `transcript_path`?
-4. **Prompt iterations:** Final prompt text after tuning — carry these into Full's `prompts.ts`
+---
 
-These findings become the acceptance criteria for Phase 2.
+### Prompt Tuning
+
+The ambiguity detection and alignment prompts carry forward from the hook-based approach. Key tuning dimensions:
+
+- **Sensitivity:** "Be conservative" controls false positive rate. Adjust confidence threshold (currently >70%) based on real usage.
+- **Output format:** The advisory is all the developer sees. Keep it tight: warning + suggested clarification.
+- **Post-advisory context:** Now includes tool activity data. Tune the prompt to reference specific tools and costs, not just abstract alignment.
+- **Scope creep detection:** The most common failure mode. Consider adding explicit examples to the prompt.
+
+---
+
+### Future Roadmap
+
+| Version | Scope |
+|---|---|
+| v0.1 | OTLP receiver + classifier + advisor + formatter (the watch process) |
+| v0.2 | SQLite logging + `radar status` + did-I-act-on-this tracking |
+| v0.3 | Pattern detection across sessions → personalised CLAUDE.md suggestions |
+| v0.4 | Optional JSONL transcript reading for deeper post-advisory (Claude's response text) |
+| v1.0 | Team opt-in: anonymised signal aggregation for platform lead visibility |
