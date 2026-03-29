@@ -85,10 +85,12 @@ function writeln(text = ''): void {
  *
  * Example:
  *   ── PRE ── 14:23:07 ── score: 0.34 ── ✓ Clear ─────
+ *   ── PRE [S1] ── 14:23:07 ── score: 0.34 ── ✓ Clear ─────
  */
-export function printPreClear(score: number): void {
+export function printPreClear(score: number, sessionLabel?: string): void {
   const time = formatTime(new Date());
-  const prefix = `── PRE ── ${time} ── score: ${score.toFixed(2)} ── ✓ Clear `;
+  const sessionPart = sessionLabel ? ` [${sessionLabel}]` : '';
+  const prefix = `── PRE${sessionPart} ── ${time} ── score: ${score.toFixed(2)} ── ✓ Clear `;
   const line = separator(prefix);
   writeln(DIM + line + RESET);
 }
@@ -98,13 +100,12 @@ export function printPreClear(score: number): void {
  *
  * Example:
  *   ── PRE ── 14:25:12 ── score: 0.78 ─────────────────
- *   ⚠ "clean up this module" is ambiguous.
- *     Claude will likely restructure imports and rename functions.
- *   ────────────────────────────────────────────────────
+ *   ── PRE [S1] ── 14:25:12 ── score: 0.78 ─────────────────
  */
-export function printPreAdvisory(score: number, advisory: string): void {
+export function printPreAdvisory(score: number, advisory: string, sessionLabel?: string): void {
   const time = formatTime(new Date());
-  const headerPrefix = `── PRE ── ${time} ── score: ${score.toFixed(2)} `;
+  const sessionPart = sessionLabel ? ` [${sessionLabel}]` : '';
+  const headerPrefix = `── PRE${sessionPart} ── ${time} ── score: ${score.toFixed(2)} `;
   const header = separator(headerPrefix);
 
   writeln(YELLOW + BOLD + header + RESET);
@@ -118,9 +119,10 @@ export function printPreAdvisory(score: number, advisory: string): void {
 }
 
 /** Shared implementation for both post-advisory box variants. */
-function printPost(color: string, content: string): void {
+function printPost(color: string, content: string, sessionLabel?: string): void {
   const time = formatTime(new Date());
-  const header = separator(`── POST ── ${time} `);
+  const sessionPart = sessionLabel ? ` [${sessionLabel}]` : '';
+  const header = separator(`── POST${sessionPart} ── ${time} `);
 
   writeln(color + BOLD + header + RESET);
 
@@ -137,12 +139,10 @@ function printPost(color: string, content: string): void {
  *
  * Example:
  *   ── POST ── 14:25:38 ────────────────────────────────
- *   ✓ Response aligned with intent.
- *     Tools: Edit (2 files) · 847 tokens · $0.003
- *   ────────────────────────────────────────────────────
+ *   ── POST [S1] ── 14:25:38 ────────────────────────────────
  */
-export function printPostAligned(summary: string): void {
-  printPost(GREEN, summary);
+export function printPostAligned(summary: string, sessionLabel?: string): void {
+  printPost(GREEN, summary, sessionLabel);
 }
 
 /**
@@ -150,12 +150,22 @@ export function printPostAligned(summary: string): void {
  *
  * Example:
  *   ── POST ── 14:31:02 ────────────────────────────────
- *   ✗ Scope exceeded likely intent.
- *     Claude ran Edit on 5 files, Bash (3 commands), 12k tokens, $0.08.
- *   ────────────────────────────────────────────────────
+ *   ── POST [S1] ── 14:31:02 ────────────────────────────────
  */
-export function printPostMisaligned(advisory: string): void {
-  printPost(RED, advisory);
+export function printPostMisaligned(advisory: string, sessionLabel?: string): void {
+  printPost(RED, advisory, sessionLabel);
+}
+
+/**
+ * Print a dim cyan session-connected line.
+ *
+ * Example:
+ *   ── S1 connected (abcd1234…) ── 14:23:07
+ */
+export function printSessionStart(label: string, sessionId: string): void {
+  const time = formatTime(new Date());
+  const shortId = sessionId.slice(0, 8);
+  writeln(DIM + CYAN + `── ${label} connected (${shortId}…) ── ${time}` + RESET);
 }
 
 /**

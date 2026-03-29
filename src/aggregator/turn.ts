@@ -22,8 +22,19 @@ export interface ApiRequestSummary {
   durationMs: number;
 }
 
+export interface SessionSummary {
+  sessionId: string;
+  label: string;           // "S1", "S2", etc.
+  turnCount: number;       // turns started
+  completedTurns: number;  // turns that hit boundary timeout
+  startedAt: number;       // ms since epoch
+  lastSeenAt: number;      // ms since epoch
+  totalCostUsd: number;    // sum across completed turns
+}
+
 export interface TurnContext {
   promptId: string;
+  sessionId: string;
   prompt: string;
   promptLength: number;
   startedAt: number;
@@ -46,6 +57,7 @@ type InternalTurnContext = Omit<
   TurnContext,
   'totalCostUsd' | 'totalInputTokens' | 'totalOutputTokens' | 'toolNames'
 >;
+
 
 function extractBashCommand(toolParameters: unknown): string | undefined {
   if (toolParameters === undefined || toolParameters === null) return undefined;
@@ -100,10 +112,21 @@ export class TurnAggregator extends EventEmitter {
   // is reused before the cleanup window expires, preventing silent context deletion.
   private readonly cleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+  private readonly sessions = new Map<string, SessionSummary>();
+  private sessionCounter = 0;
+
   constructor(options?: TurnAggregatorOptions) {
     super();
     this.boundaryTimeoutMs = options?.boundaryTimeoutMs ?? 5000;
     this.cleanupAfterMs = options?.cleanupAfterMs ?? 300_000;
+  }
+
+  getSessions(): SessionSummary[] {
+    return [...this.sessions.values()];
+  }
+
+  getSession(sessionId: string): SessionSummary | undefined {
+    return this.sessions.get(sessionId);
   }
 
   addEvent(event: UserPromptEvent | ToolResultEvent | ApiRequestEvent | ApiErrorEvent): void {
@@ -123,6 +146,7 @@ export class TurnAggregator extends EventEmitter {
 
       const internal: InternalTurnContext = {
         promptId,
+        sessionId: event.sessionId,
         prompt: '',
         promptLength: 0,
         startedAt: Date.now(),
@@ -131,6 +155,25 @@ export class TurnAggregator extends EventEmitter {
         errors: [],
       };
       this.contexts.set(promptId, internal);
+
+      // Session tracking
+      if (!this.sessions.has(event.sessionId)) {
+        const session: SessionSummary = {
+          sessionId: event.sessionId,
+          label: `S${++this.sessionCounter}`,
+          turnCount: 1,
+          completedTurns: 0,
+          startedAt: Date.now(),
+          lastSeenAt: Date.now(),
+          totalCostUsd: 0,
+        };
+        this.sessions.set(event.sessionId, session);
+        this.emit('session_start', { ...session });
+      } else {
+        const session = this.sessions.get(event.sessionId)!;
+        session.lastSeenAt = Date.now();
+        session.turnCount++;
+      }
     }
 
     const ctx = this.contexts.get(promptId)!;
@@ -193,6 +236,12 @@ export class TurnAggregator extends EventEmitter {
       this.boundaryTimers.delete(promptId);
       const internal = this.contexts.get(promptId);
       if (internal) {
+        // Update session stats
+        const session = this.sessions.get(internal.sessionId);
+        if (session) {
+          session.completedTurns++;
+          session.totalCostUsd += internal.apiRequests.reduce((s, r) => s + r.costUsd, 0);
+        }
         this.emit('turn_complete', buildPublicContext(internal));
         // Schedule cleanup — store handle so it can be cancelled if the promptId
         // is reused before the window expires.

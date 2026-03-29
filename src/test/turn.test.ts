@@ -1,25 +1,27 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { TurnAggregator } from '../aggregator/turn.js';
-import type { TurnContext } from '../aggregator/turn.js';
+import type { TurnContext, SessionSummary } from '../aggregator/turn.js';
 import type { UserPromptEvent, ToolResultEvent, ApiRequestEvent, ApiErrorEvent } from '../receiver/otlp.js';
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
-function makePromptEvent(promptId: string, prompt = 'fix the auth bug'): UserPromptEvent {
+function makePromptEvent(promptId: string, prompt = 'fix the auth bug', sessionId = 'test-session-1'): UserPromptEvent {
   return {
     type: 'user_prompt',
     promptId,
+    sessionId,
     timestampMs: Date.now(),
     prompt,
     promptLength: prompt.length,
   };
 }
 
-function makeToolEvent(promptId: string, toolName = 'Edit', success = true): ToolResultEvent {
+function makeToolEvent(promptId: string, toolName = 'Edit', success = true, sessionId = 'test-session-1'): ToolResultEvent {
   return {
     type: 'tool_result',
     promptId,
+    sessionId,
     timestampMs: Date.now(),
     toolName,
     success,
@@ -27,10 +29,11 @@ function makeToolEvent(promptId: string, toolName = 'Edit', success = true): Too
   };
 }
 
-function makeBashEvent(promptId: string, command: string): ToolResultEvent {
+function makeBashEvent(promptId: string, command: string, sessionId = 'test-session-1'): ToolResultEvent {
   return {
     type: 'tool_result',
     promptId,
+    sessionId,
     timestampMs: Date.now(),
     toolName: 'Bash',
     success: true,
@@ -39,10 +42,11 @@ function makeBashEvent(promptId: string, command: string): ToolResultEvent {
   };
 }
 
-function makeApiEvent(promptId: string, costUsd = 0.005, inputTokens = 300, outputTokens = 150): ApiRequestEvent {
+function makeApiEvent(promptId: string, costUsd = 0.005, inputTokens = 300, outputTokens = 150, sessionId = 'test-session-1'): ApiRequestEvent {
   return {
     type: 'api_request',
     promptId,
+    sessionId,
     timestampMs: Date.now(),
     model: 'claude-sonnet-4-5',
     costUsd,
@@ -52,10 +56,11 @@ function makeApiEvent(promptId: string, costUsd = 0.005, inputTokens = 300, outp
   };
 }
 
-function makeErrorEvent(promptId: string, error = 'Rate limit'): ApiErrorEvent {
+function makeErrorEvent(promptId: string, error = 'Rate limit', sessionId = 'test-session-1'): ApiErrorEvent {
   return {
     type: 'api_error',
     promptId,
+    sessionId,
     timestampMs: Date.now(),
     error,
     statusCode: 429,
@@ -220,5 +225,95 @@ describe('TurnAggregator', () => {
   test('returns undefined for unknown promptId', () => {
     const agg = new TurnAggregator({ boundaryTimeoutMs: 100 });
     assert.equal(agg.getContext('does-not-exist'), undefined);
+  });
+});
+
+describe('Session tracking', () => {
+  test('emits session_start on first event from a new sessionId', () => {
+    const agg = new TurnAggregator({ boundaryTimeoutMs: 100 });
+    const sessions: SessionSummary[] = [];
+    agg.on('session_start', (s: SessionSummary) => sessions.push(s));
+
+    agg.addEvent(makePromptEvent('p-a1', 'hello', 'sess-A'));
+    agg.addEvent(makeToolEvent('p-a1', 'Edit', true, 'sess-A'));
+
+    assert.equal(sessions.length, 1, 'session_start should fire once');
+    assert.equal(sessions[0].label, 'S1');
+    assert.equal(sessions[0].sessionId, 'sess-A');
+    assert.equal(sessions[0].turnCount, 1);
+  });
+
+  test('assigns incrementing labels to different sessions', () => {
+    const agg = new TurnAggregator({ boundaryTimeoutMs: 100 });
+    const sessions: SessionSummary[] = [];
+    agg.on('session_start', (s: SessionSummary) => sessions.push(s));
+
+    agg.addEvent(makePromptEvent('p-b1', 'hello', 'sess-A'));
+    agg.addEvent(makePromptEvent('p-b2', 'world', 'sess-B'));
+
+    assert.equal(sessions.length, 2);
+    assert.equal(sessions[0].label, 'S1');
+    assert.equal(sessions[1].label, 'S2');
+  });
+
+  test('tracks turnCount correctly', () => {
+    const agg = new TurnAggregator({ boundaryTimeoutMs: 100 });
+    agg.on('session_start', () => {});
+
+    agg.addEvent(makePromptEvent('p-c1', 'first', 'sess-C'));
+    agg.addEvent(makePromptEvent('p-c2', 'second', 'sess-C'));
+
+    const session = agg.getSession('sess-C');
+    assert.ok(session);
+    assert.equal(session.turnCount, 2);
+  });
+
+  test('accumulates totalCostUsd on turn_complete', async () => {
+    const agg = new TurnAggregator({ boundaryTimeoutMs: 100, cleanupAfterMs: 60_000 });
+
+    agg.addEvent(makePromptEvent('p-d1', 'hello', 'sess-D'));
+    agg.addEvent(makeApiEvent('p-d1', 0.007, 300, 100, 'sess-D'));
+
+    await new Promise((r) => setTimeout(r, 200));
+
+    const session = agg.getSession('sess-D');
+    assert.ok(session);
+    assert.ok(session.totalCostUsd > 0, 'totalCostUsd should be accumulated');
+    assert.equal(session.completedTurns, 1);
+  });
+
+  test('getSessions() returns all tracked sessions', () => {
+    const agg = new TurnAggregator({ boundaryTimeoutMs: 100 });
+
+    agg.addEvent(makePromptEvent('p-e1', 'hello', 'sess-E1'));
+    agg.addEvent(makePromptEvent('p-e2', 'world', 'sess-E2'));
+
+    const all = agg.getSessions();
+    assert.equal(all.length, 2);
+    const ids = all.map((s) => s.sessionId).sort();
+    assert.deepEqual(ids, ['sess-E1', 'sess-E2']);
+  });
+
+  test('getSession() returns a specific session by ID', () => {
+    const agg = new TurnAggregator({ boundaryTimeoutMs: 100 });
+
+    agg.addEvent(makePromptEvent('p-f1', 'hello', 'sess-F'));
+
+    const session = agg.getSession('sess-F');
+    assert.ok(session);
+    assert.equal(session.sessionId, 'sess-F');
+    assert.equal(session.label, 'S1');
+
+    assert.equal(agg.getSession('unknown-session'), undefined);
+  });
+
+  test('TurnContext includes sessionId', () => {
+    const agg = new TurnAggregator({ boundaryTimeoutMs: 100 });
+
+    agg.addEvent(makePromptEvent('p-g1', 'hello', 'sess-G'));
+
+    const ctx = agg.getContext('p-g1');
+    assert.ok(ctx);
+    assert.equal(ctx.sessionId, 'sess-G');
   });
 });

@@ -13,6 +13,7 @@ export type RadarEventType =
 export interface BaseEvent {
   type: RadarEventType;
   promptId: string;
+  sessionId: string;
   timestampMs: number;
 }
 
@@ -122,7 +123,7 @@ function getBool(map: Map<string, AttrValue>, key: string): boolean {
 
 // ─── Log record → RadarEvent ──────────────────────────────────────────────────
 
-function parseLogRecord(record: OtlpLogRecord): RadarEvent | null {
+function parseLogRecord(record: OtlpLogRecord, sessionId: string): RadarEvent | null {
   const eventName = record.body?.stringValue ?? '';
 
   // timeUnixNano is a string representing nanoseconds (may exceed JS safe int)
@@ -133,7 +134,7 @@ function parseLogRecord(record: OtlpLogRecord): RadarEvent | null {
   const attrs = buildAttrMap(record.attributes);
 
   const promptId = getString(attrs, 'prompt.id');
-  const base: BaseEvent = { type: 'unknown', promptId, timestampMs };
+  const base: BaseEvent = { type: 'unknown', promptId, sessionId, timestampMs };
 
   switch (eventName) {
     case 'claude_code.user_prompt': {
@@ -194,11 +195,26 @@ function parseLogRecord(record: OtlpLogRecord): RadarEvent | null {
 
 export class OtlpReceiver extends EventEmitter {
   private readonly port: number;
+  private readonly fallbackSessionId: string;
   private server: http.Server | null = null;
 
   constructor(port = 4820) {
     super();
     this.port = port;
+    this.fallbackSessionId = `radar-${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  private deriveSessionId(resourceAttrs: Map<string, AttrValue>): string {
+    const sessionId = resourceAttrs.get('session.id');
+    if (typeof sessionId === 'string' && sessionId) return sessionId;
+
+    const instanceId = resourceAttrs.get('service.instance.id');
+    if (typeof instanceId === 'string' && instanceId) return instanceId;
+
+    const pid = resourceAttrs.get('process.pid');
+    if (pid !== undefined) return String(pid);
+
+    return this.fallbackSessionId;
   }
 
   start(): Promise<void> {
@@ -273,9 +289,11 @@ export class OtlpReceiver extends EventEmitter {
 
   private processPayload(payload: OtlpLogsPayload): void {
     for (const resourceLog of payload.resourceLogs ?? []) {
+      const resourceAttrs = buildAttrMap(resourceLog.resource?.attributes);
+      const sessionId = this.deriveSessionId(resourceAttrs);
       for (const scopeLog of resourceLog.scopeLogs ?? []) {
         for (const record of scopeLog.logRecords ?? []) {
-          const event = parseLogRecord(record);
+          const event = parseLogRecord(record, sessionId);
           if (event) {
             this.emit('event', event);
           }

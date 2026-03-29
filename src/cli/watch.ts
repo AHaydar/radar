@@ -1,7 +1,7 @@
 import { OtlpReceiver } from '../receiver/otlp.js';
 import type { RadarEvent } from '../receiver/otlp.js';
 import { TurnAggregator } from '../aggregator/turn.js';
-import type { TurnContext } from '../aggregator/turn.js';
+import type { TurnContext, SessionSummary } from '../aggregator/turn.js';
 import { Classifier } from '../analysis/classifier.js';
 import { Advisor } from '../analysis/advisor.js';
 import {
@@ -10,6 +10,7 @@ import {
   printPreAdvisory,
   printPostAligned,
   printPostMisaligned,
+  printSessionStart,
   printWarning,
   printError,
 } from '../output/formatter.js';
@@ -40,6 +41,14 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
   let warnedAboutMissingPrompt = false;
   // Prevent double-classification if the same promptId is seen more than once
   const classifying = new Set<string>();
+  // Map sessionId → display label ("S1", "S2", …)
+  const sessionLabels = new Map<string, string>();
+
+  // ── Wire: session_start → label tracking + display ────────────────────────
+  aggregator.on('session_start', (s: SessionSummary) => {
+    sessionLabels.set(s.sessionId, s.label);
+    printSessionStart(s.label, s.sessionId);
+  });
 
   // ── Wire: OtlpReceiver → TurnAggregator + classification ───────────────────
   //
@@ -63,7 +72,7 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
       );
     }
 
-    void runPreAdvisory(event.prompt, event.promptId);
+    void runPreAdvisory(event.prompt, event.promptId, sessionLabels.get(event.sessionId));
   });
 
   receiver.on('error', (err: Error) => {
@@ -72,24 +81,24 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
 
   // ── Wire: TurnAggregator → post-advisory ───────────────────────────────────
   aggregator.on('turn_complete', (ctx: TurnContext) => {
-    void runPostAdvisory(ctx);
+    void runPostAdvisory(ctx, sessionLabels.get(ctx.sessionId));
   });
 
   // ── Pre-advisory pipeline ───────────────────────────────────────────────────
-  async function runPreAdvisory(prompt: string, promptId: string): Promise<void> {
+  async function runPreAdvisory(prompt: string, promptId: string, sessionLabel?: string): Promise<void> {
     try {
       if (!prompt) return; // no prompt text — skip silently
 
       const result = await classifier.classify(prompt);
 
       if (result.score < scoreThreshold) {
-        printPreClear(result.score);
+        printPreClear(result.score, sessionLabel);
         return;
       }
 
       // Score >= threshold: escalate to Sonnet
       const advisory = await advisor.preAdvisory(prompt, result);
-      printPreAdvisory(result.score, advisory.text);
+      printPreAdvisory(result.score, advisory.text, sessionLabel);
     } catch (err) {
       printError(`Pre-advisory failed for prompt ${promptId}: ${errMsg(err)}`);
     } finally {
@@ -100,16 +109,16 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
   }
 
   // ── Post-advisory pipeline ──────────────────────────────────────────────────
-  async function runPostAdvisory(ctx: TurnContext): Promise<void> {
+  async function runPostAdvisory(ctx: TurnContext, sessionLabel?: string): Promise<void> {
     if (!ctx.prompt) return; // no prompt text — skip silently
 
     try {
       const result = await advisor.postAdvisory(ctx);
 
       if (result.aligned === false) {
-        printPostMisaligned(result.text);
+        printPostMisaligned(result.text, sessionLabel);
       } else {
-        printPostAligned(result.text);
+        printPostAligned(result.text, sessionLabel);
       }
     } catch (err) {
       printError(`Post-advisory failed for prompt ${ctx.promptId}: ${errMsg(err)}`);
