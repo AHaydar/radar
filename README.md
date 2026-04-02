@@ -1,104 +1,111 @@
-# Radar
+# radar-cc
 
-A Claude Code sidecar that flags ambiguous prompts and checks whether Claude's actions matched your intent — displayed in a second terminal pane.
+Intent alignment checker for Claude Code. Radar watches Claude Code's OpenTelemetry stream and tells you — in a second terminal pane — whether your prompt was clear before Claude starts, and whether Claude stayed on target after it finishes.
 
----
+## Requirements
 
-## The problem
+- Node.js >= 22
+- An Anthropic API key
 
-Claude Code's responses are only as good as the developer's intent, but intent is not often communicated precisely.
+## Install
 
-| You say | Claude does | You meant |
-|---|---|---|
-| "clean up this module" | Restructures imports, renames functions, splits files | Delete the 3 commented-out functions |
-| "the API is slow" | Adds Redis caching across 4 endpoints | Profile this one DB query |
-| "update the tests" | Rewrites the entire test suite | Add coverage for 2 new edge cases |
-
-
-Radar analyses at two moments: early in Claude's turn (pre-advisory, based on prompt text) and after Claude finishes (post-advisory, based on what tools Claude used and what it changed).
-There's a limitiation in the current version: Sonnet is inferring intent alignment from side effects without seeing Claude's actual response. It knows Claude touched 5 files but not why Claude explained it did so. That's a reasonable proxy most of the time — scope creep and wrong-target are visible in tool activity — but it'll miss subtler misalignments where Claude did the right amount of work on the wrong thing within the same. The reason for that is that the OTel events Claude Code emits are operational telemetry — user_prompt, tool_result, api_request, api_error. They tell you what happened mechanically. The actual assistant message (what Claude wrote back to the developer) isn't an OTel event. In a future version we can fix that subtlety through parsing the jsonl files.
-
-
----
-
-## Installation
-
-The package isn't published to npm yet. To install locally from the repo:
-
-```bash
-git clone https://github.com/ahaydar/radar.git
-cd radar
-npm install
-npm run build
-npm link
+```sh
+npm install -g radar-cc
+radar setup
 ```
 
-Add the OTel env vars to your shell profile:
+`radar setup` writes the required OTel environment variables to `~/.claude/settings.json` and walks you through storing your Anthropic API key — either on local disk or in 1Password. Restart Claude Code after running it.
 
-```bash
-cat >> ~/.zshrc << 'EOF'
+You can also pass the key directly to skip the prompt:
 
-# Radar: Claude Code OTel config
-export CLAUDE_CODE_ENABLE_TELEMETRY=1
-export OTEL_LOGS_EXPORTER=otlp
-export OTEL_EXPORTER_OTLP_PROTOCOL=http/json
-export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://localhost:4820/v1/logs
-export OTEL_LOG_USER_PROMPTS=1
-export OTEL_LOG_TOOL_DETAILS=1
-export OTEL_LOGS_EXPORT_INTERVAL=2000
-EOF
-source ~/.zshrc
+```sh
+radar setup --api-key <your-key>
 ```
-
-Replace `~/.zshrc` with `~/.bashrc` if using Bash. These are safe to have permanently — if Radar isn't running, Claude Code silently ignores them.
 
 ## Usage
 
-Radar requires an Anthropic API key. Set it in your environment:
+Open a second terminal pane alongside Claude Code and run:
 
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-```
-
-Or pass it directly:
-
-```bash
-radar watch --api-key sk-ant-...
-```
-
-In one terminal pane, start Radar:
-
-```bash
+```sh
 radar watch
 ```
 
-In another pane, start Claude Code normally. Telemetry flows automatically.
+Send prompts in your Claude Code pane as normal. Radar listens passively on `localhost:4820`.
 
-Claude Code must be started (or restarted) after the env vars are set — it reads them at launch.
+## Output
 
-### Dev mode
+```
+── Radar v0.1.0 ─────────────────────────────────────
+Listening on localhost:4820
+Waiting for Claude Code telemetry...
+─────────────────────────────────────────────────────
 
-`npm run dev` compiles TypeScript in watch mode and simultaneously runs `radar watch`, restarting it whenever the build changes:
+── PRE ── 14:23:07 ── score: 0.34 ── ✓ Clear ────────
 
-```bash
-ANTHROPIC_API_KEY=sk-ant-... npm run dev
+── PRE ── 14:25:12 ── score: 0.78 ───────────────────
+⚠ "clean up this module" is ambiguous.
+  Claude will likely restructure imports and rename functions.
+  Did you mean: remove the 3 commented-out functions?
+  → Try: "delete the dead code in auth.ts — the 3 commented
+    functions at the bottom"
+─────────────────────────────────────────────────────
+
+── POST ── 14:25:38 ──────────────────────────────────
+✓ Response aligned with intent.
+  Tools: Edit (2 files) · 847 tokens · $0.003
+─────────────────────────────────────────────────────
+
+── POST ── 14:31:02 ──────────────────────────────────
+✗ Scope exceeded likely intent.
+  Claude ran Edit on 5 files, Bash (3 commands), 12k tokens, $0.08.
+  Developer likely wanted: coverage for 2 new edge cases only.
+  → "undo all changes. add test cases for the null input
+    and timeout edge cases in processOrder — nothing else"
+─────────────────────────────────────────────────────
 ```
 
----
+PRE advisories fire within ~2 seconds of your prompt. POST advisories fire after Claude's turn ends, based on what tools it used and what it changed — not Claude's response text, which OTel does not expose.
 
 ## How it works
 
-**Pre-advisory:** When you submit a prompt, Claude Code emits it via OTel. Radar's Haiku classifier scores its ambiguity. If risk is high, Sonnet prints a warning in the Radar pane — what Claude will likely misinterpret and how to rephrase. Claude is already working at this point; you can hit Esc to interrupt if the warning is serious.
+Claude Code emits structured OTel log events (`user_prompt`, `tool_result`, `api_request`) when telemetry is enabled. Radar runs a lightweight OTLP HTTP receiver on `localhost:4820` that collects these events without touching Claude's execution path.
 
-**Post-advisory:** After Claude's turn ends (no new tool calls for ~5s), Sonnet reviews the accumulated activity — tools called, files edited, commands run, tokens spent — and checks whether it matched your likely intent. If misaligned, it prints a suggested re-prompt.
+- **Pre-advisory:** Haiku scores the prompt for ambiguity. If the score is >= 0.6, Sonnet prints a warning with the most likely misinterpretation and a suggested clarification.
+- **Post-advisory:** After no new events for ~5 seconds (turn boundary), Sonnet reviews the accumulated tool activity against the original prompt intent and flags scope drift.
 
-Radar stays silent when everything looks clear.
+Claude is never blocked or interrupted.
 
----
+## OTel variables (set by `radar setup`)
 
-## Tuning
+| Variable | Value |
+|---|---|
+| `CLAUDE_CODE_ENABLE_TELEMETRY` | `1` |
+| `OTEL_LOGS_EXPORTER` | `otlp` |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/json` |
+| `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | `http://localhost:4820/v1/logs` |
+| `OTEL_LOG_USER_PROMPTS` | `1` |
+| `OTEL_LOG_TOOL_DETAILS` | `1` |
+| `OTEL_LOGS_EXPORT_INTERVAL` | `2000` |
 
-Prompt templates are in `src/analysis/prompts.ts`. Key tuning dimensions:
+`OTEL_LOG_USER_PROMPTS=1` is required for prompt content analysis. Without it, Radar can detect turn boundaries but cannot analyze intent.
 
-- **Sensitivity:** Classifier flags prompts above a 0.6 ambiguity score. Raise to 0.7 if too noisy; lower to 0.5 if missing obvious cases.
-- **Post-advisory context:** The advisor sees tool activity (files, commands, cost) but not Claude's response text. Tune the prompt to reference specific tools and costs.
+These are written to the `env` block in `~/.claude/settings.json`. If Radar is not running, Claude Code silently ignores them.
+
+## Options
+
+```
+radar setup [options]
+
+  -k, --api-key <key>       API key to store (skips the interactive prompt)
+
+radar watch [options]
+
+  -p, --port <number>       OTLP listener port (default: 4820)
+  -t, --timeout <ms>        Turn boundary silence window (default: 5000)
+  -s, --threshold <score>   Ambiguity score threshold 0.0–1.0 (default: 0.6)
+  -k, --api-key <key>       Anthropic API key (overrides all stored sources)
+```
+
+## License
+
+MIT

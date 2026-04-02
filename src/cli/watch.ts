@@ -125,6 +125,17 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
     }
   }
 
+  // ── OTel env var check ─────────────────────────────────────────────────────
+  const requiredOtelVars = [
+    'CLAUDE_CODE_ENABLE_TELEMETRY',
+    'OTEL_LOGS_EXPORTER',
+    'OTEL_EXPORTER_OTLP_LOGS_ENDPOINT',
+  ];
+  const missingVars = requiredOtelVars.filter((v) => !process.env[v]);
+  if (missingVars.length > 0) {
+    printWarning('OTel env vars not configured. Run `radar setup` and restart Claude Code.');
+  }
+
   // ── Start ───────────────────────────────────────────────────────────────────
   try {
     await receiver.start();
