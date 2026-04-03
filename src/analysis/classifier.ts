@@ -48,13 +48,16 @@ export class Classifier {
 
 function parseClassifierResponse(raw: string): ClassifierResult {
   try {
-    // Extract JSON — handle cases where the model wraps it in markdown code blocks
-    const jsonMatch = raw.match(/\{[^{}]*\}/);
-    if (!jsonMatch) {
+    // Extract JSON — handle markdown code blocks and nested objects by
+    // finding the outermost { … } span rather than using a regex that
+    // breaks on nested braces.
+    const start = raw.indexOf('{');
+    const end = raw.lastIndexOf('}');
+    if (start === -1 || end === -1 || end < start) {
       return CLASSIFIER_FALLBACK;
     }
 
-    const parsed = JSON.parse(jsonMatch[0]) as unknown;
+    const parsed = JSON.parse(raw.slice(start, end + 1)) as unknown;
 
     if (
       typeof parsed !== 'object' ||

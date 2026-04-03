@@ -4,6 +4,7 @@ import type {
   ToolResultEvent,
   ApiRequestEvent,
   ApiErrorEvent,
+  ToolDecisionEvent,
 } from '../receiver/otlp.js';
 
 export interface ToolResultSummary {
@@ -22,11 +23,17 @@ export interface ApiRequestSummary {
   durationMs: number;
 }
 
+export interface ToolDecisionSummary {
+  toolName: string;
+  decision: string;
+  source: string;
+}
+
 export interface SessionSummary {
   sessionId: string;
   label: string;           // "S1", "S2", etc.
   turnCount: number;       // turns started
-  completedTurns: number;  // turns that hit boundary timeout
+  completedTurns: number;  // turns completed via Stop hook
   startedAt: number;       // ms since epoch
   lastSeenAt: number;      // ms since epoch
   totalCostUsd: number;    // sum across completed turns
@@ -41,16 +48,12 @@ export interface TurnContext {
   toolResults: ToolResultSummary[];
   apiRequests: ApiRequestSummary[];
   errors: string[];
+  toolDecisions: ToolDecisionSummary[];
   // Computed helpers:
   totalCostUsd: number;
   totalInputTokens: number;
   totalOutputTokens: number;
   toolNames: string[];
-}
-
-export interface TurnAggregatorOptions {
-  boundaryTimeoutMs?: number;
-  cleanupAfterMs?: number;
 }
 
 type InternalTurnContext = Omit<
@@ -103,23 +106,20 @@ function buildPublicContext(internal: InternalTurnContext): TurnContext {
 }
 
 export class TurnAggregator extends EventEmitter {
-  private readonly boundaryTimeoutMs: number;
-  private readonly cleanupAfterMs: number;
+  // Delay to allow in-flight OTel events to arrive after Stop hook fires.
+  // Must be longer than OTEL_LOGS_EXPORT_INTERVAL (configured at 2000ms).
+  static readonly COMPLETION_DELAY_MS = 3500;
 
   private readonly contexts = new Map<string, InternalTurnContext>();
-  private readonly boundaryTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  // Tracks pending context-cleanup timers so they can be cancelled if a promptId
-  // is reused before the cleanup window expires, preventing silent context deletion.
-  private readonly cleanupTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  // Maps sessionId → promptId for the most recent active turn
+  private readonly activeTurns = new Map<string, string>();
+  // Sessions where Stop hook fired before any OTel events arrived
+  private readonly pendingStops = new Set<string>();
+  // Active delayed-completion timers, keyed by sessionId
+  private readonly completionTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   private readonly sessions = new Map<string, SessionSummary>();
   private sessionCounter = 0;
-
-  constructor(options?: TurnAggregatorOptions) {
-    super();
-    this.boundaryTimeoutMs = options?.boundaryTimeoutMs ?? 5000;
-    this.cleanupAfterMs = options?.cleanupAfterMs ?? 300_000;
-  }
 
   getSessions(): SessionSummary[] {
     return [...this.sessions.values()];
@@ -129,21 +129,14 @@ export class TurnAggregator extends EventEmitter {
     return this.sessions.get(sessionId);
   }
 
-  addEvent(event: UserPromptEvent | ToolResultEvent | ApiRequestEvent | ApiErrorEvent): void {
+  addEvent(
+    event: UserPromptEvent | ToolResultEvent | ApiRequestEvent | ApiErrorEvent | ToolDecisionEvent,
+  ): void {
     const { promptId } = event;
 
     const isNew = !this.contexts.has(promptId);
 
     if (isNew) {
-      // Cancel any pending cleanup for this promptId (handles promptId reuse
-      // within the cleanup window — prevents an orphaned timer from silently
-      // deleting the freshly created context mid-flight).
-      const pendingCleanup = this.cleanupTimers.get(promptId);
-      if (pendingCleanup !== undefined) {
-        clearTimeout(pendingCleanup);
-        this.cleanupTimers.delete(promptId);
-      }
-
       const internal: InternalTurnContext = {
         promptId,
         sessionId: event.sessionId,
@@ -153,8 +146,16 @@ export class TurnAggregator extends EventEmitter {
         toolResults: [],
         apiRequests: [],
         errors: [],
+        toolDecisions: [],
       };
       this.contexts.set(promptId, internal);
+      this.activeTurns.set(event.sessionId, promptId);
+
+      // If a stop arrived before this turn's OTel events, schedule completion now
+      if (this.pendingStops.has(event.sessionId)) {
+        this.pendingStops.delete(event.sessionId);
+        this._scheduleDelayedComplete(event.sessionId);
+      }
 
       // Session tracking
       if (!this.sessions.has(event.sessionId)) {
@@ -211,48 +212,83 @@ export class TurnAggregator extends EventEmitter {
         ctx.errors.push(event.error);
         break;
       }
+      case 'tool_decision': {
+        ctx.toolDecisions.push({
+          toolName: event.toolName,
+          decision: event.decision,
+          source: event.source,
+        });
+        break;
+      }
     }
 
     if (isNew) {
       this.emit('turn_start', buildPublicContext(ctx));
     }
+  }
 
-    this.resetBoundaryTimer(promptId);
+  /**
+   * Schedule turn completion after the Stop hook fires, with a delay to allow
+   * in-flight OTel events to arrive. Handles two cases:
+   * - Stop fires after OTel: waits COMPLETION_DELAY_MS then completes.
+   * - Stop fires before OTel: stores a pending stop; addEvent will reschedule
+   *   once the turn context is created.
+   */
+  scheduleCompletion(sessionId: string): void {
+    // Cancel any existing timer for this session
+    const existing = this.completionTimers.get(sessionId);
+    if (existing !== undefined) {
+      clearTimeout(existing);
+      this.completionTimers.delete(sessionId);
+    }
+
+    if (!this.activeTurns.has(sessionId)) {
+      // No active turn yet — OTel events haven't arrived.
+      // Mark as pending; addEvent will reschedule once the context is created.
+      this.pendingStops.add(sessionId);
+      return;
+    }
+
+    this._scheduleDelayedComplete(sessionId);
+  }
+
+  private _scheduleDelayedComplete(sessionId: string): void {
+    const timer = setTimeout(() => {
+      this.completionTimers.delete(sessionId);
+      this.completeTurn(sessionId);
+    }, TurnAggregator.COMPLETION_DELAY_MS);
+    this.completionTimers.set(sessionId, timer);
+  }
+
+  /**
+   * Signal that the turn for a given session is complete (called when the Stop
+   * hook fires). Emits 'turn_complete' and cleans up the context immediately.
+   */
+  completeTurn(sessionId: string): void {
+    const promptId = this.activeTurns.get(sessionId);
+    if (!promptId) return;
+
+    const internal = this.contexts.get(promptId);
+    if (!internal) return;
+
+    this.activeTurns.delete(sessionId);
+
+    // Update session stats
+    const session = this.sessions.get(sessionId);
+    if (session) {
+      session.completedTurns++;
+      session.totalCostUsd += internal.apiRequests.reduce((s, r) => s + r.costUsd, 0);
+    }
+
+    this.emit('turn_complete', buildPublicContext(internal));
+
+    // Clean up context — turn is done
+    this.contexts.delete(promptId);
   }
 
   getContext(promptId: string): TurnContext | undefined {
     const internal = this.contexts.get(promptId);
     if (!internal) return undefined;
     return buildPublicContext(internal);
-  }
-
-  private resetBoundaryTimer(promptId: string): void {
-    const existing = this.boundaryTimers.get(promptId);
-    if (existing !== undefined) {
-      clearTimeout(existing);
-    }
-
-    const timer = setTimeout(() => {
-      this.boundaryTimers.delete(promptId);
-      const internal = this.contexts.get(promptId);
-      if (internal) {
-        // Update session stats
-        const session = this.sessions.get(internal.sessionId);
-        if (session) {
-          session.completedTurns++;
-          session.totalCostUsd += internal.apiRequests.reduce((s, r) => s + r.costUsd, 0);
-        }
-        this.emit('turn_complete', buildPublicContext(internal));
-        // Schedule cleanup — store handle so it can be cancelled if the promptId
-        // is reused before the window expires.
-        const cleanupTimer = setTimeout(() => {
-          this.contexts.delete(promptId);
-          this.cleanupTimers.delete(promptId);
-        }, this.cleanupAfterMs);
-        this.cleanupTimers.set(promptId, cleanupTimer);
-      }
-    }, this.boundaryTimeoutMs);
-
-    this.boundaryTimers.set(promptId, timer);
   }
 }

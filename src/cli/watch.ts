@@ -17,7 +17,6 @@ import {
 
 export interface WatchOptions {
   port?: number;
-  boundaryTimeoutMs?: number;
   scoreThreshold?: number;
   apiKey?: string;
 }
@@ -31,9 +30,7 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
   const scoreThreshold = options.scoreThreshold ?? 0.6;
 
   const receiver = new OtlpReceiver(port);
-  const aggregator = new TurnAggregator({
-    boundaryTimeoutMs: options.boundaryTimeoutMs ?? 5000,
-  });
+  const aggregator = new TurnAggregator();
   const classifier = new Classifier(options.apiKey);
   const advisor = new Advisor(options.apiKey);
 
@@ -79,6 +76,14 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
     printError(`OTLP server error: ${err.message}`);
   });
 
+  // ── Wire: Stop hook → turn completion ──────────────────────────────────────
+  // Uses scheduleCompletion (not completeTurn directly) to handle the race
+  // between the Stop hook and OTel's export interval (2s): the stop signal
+  // often arrives before telemetry events are flushed.
+  receiver.on('stop', (sessionId: string) => {
+    aggregator.scheduleCompletion(sessionId);
+  });
+
   // ── Wire: TurnAggregator → post-advisory ───────────────────────────────────
   aggregator.on('turn_complete', (ctx: TurnContext) => {
     void runPostAdvisory(ctx, sessionLabels.get(ctx.sessionId));
@@ -117,8 +122,12 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
 
       if (result.aligned === false) {
         printPostMisaligned(result.text, sessionLabel);
-      } else {
+      } else if (result.aligned === true) {
         printPostAligned(result.text, sessionLabel);
+      } else {
+        // aligned is undefined: timeout, error, or unexpected model format —
+        // surface as a warning rather than silently showing a green box.
+        printWarning(`Post-advisory: ${result.text}`);
       }
     } catch (err) {
       printError(`Post-advisory failed for prompt ${ctx.promptId}: ${errMsg(err)}`);

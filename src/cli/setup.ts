@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { createInterface } from 'node:readline';
@@ -14,6 +14,8 @@ import {
 
 const CLAUDE_DIR = join(homedir(), '.claude');
 const SETTINGS_PATH = join(CLAUDE_DIR, 'settings.json');
+const RADAR_HOOKS_DIR = join(homedir(), '.radar', 'hooks');
+const STOP_HOOK_PATH = join(RADAR_HOOKS_DIR, 'stop.sh');
 
 const OTEL_VARS: Record<string, string> = {
   CLAUDE_CODE_ENABLE_TELEMETRY: '1',
@@ -68,6 +70,64 @@ function question(rl: ReturnType<typeof createInterface>, prompt: string): Promi
   return new Promise((resolve) => rl.question(prompt, resolve));
 }
 
+// ─── Stop hook installation ───────────────────────────────────────────────────
+
+const STOP_HOOK_SCRIPT = `#!/bin/bash
+INPUT=$(cat)
+SESSION_ID=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null)
+if [ -n "$SESSION_ID" ]; then
+  curl -s -X POST "http://localhost:\${RADAR_PORT:-4820}/v1/hook/stop" \\
+    -H "Content-Type: application/json" \\
+    -d "{\\"sessionId\\": \\"$SESSION_ID\\"}" &>/dev/null &
+fi
+`;
+
+function writeStopHook(): void {
+  if (!existsSync(RADAR_HOOKS_DIR)) {
+    mkdirSync(RADAR_HOOKS_DIR, { recursive: true });
+  }
+  writeFileSync(STOP_HOOK_PATH, STOP_HOOK_SCRIPT, 'utf8');
+  chmodSync(STOP_HOOK_PATH, 0o755);
+}
+
+function installStopHooks(settings: Record<string, unknown>): void {
+  const hooks = (settings.hooks as Record<string, unknown[]> | undefined) ?? {};
+
+  const hookEntry = {
+    hooks: [
+      {
+        type: 'command',
+        command: STOP_HOOK_PATH,
+        async: true,
+      },
+    ],
+  };
+
+  // Helper: append hook entry if not already present (idempotent)
+  function appendHook(hookName: string): void {
+    const existing = (hooks[hookName] as unknown[] | undefined) ?? [];
+    const alreadyInstalled = existing.some((h) => {
+      if (typeof h !== 'object' || h === null) return false;
+      const hooksArr = (h as Record<string, unknown>).hooks;
+      if (!Array.isArray(hooksArr)) return false;
+      return hooksArr.some(
+        (inner) =>
+          typeof inner === 'object' &&
+          inner !== null &&
+          (inner as Record<string, unknown>).command === STOP_HOOK_PATH,
+      );
+    });
+    if (!alreadyInstalled) {
+      hooks[hookName] = [...existing, hookEntry];
+    }
+  }
+
+  appendHook('Stop');
+  appendHook('StopFailure');
+
+  settings.hooks = hooks;
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 export async function runSetup(preEnteredKey?: string): Promise<void> {
@@ -95,6 +155,24 @@ export async function runSetup(preEnteredKey?: string): Promise<void> {
 
   settings.env = { ...existingEnv, ...OTEL_VARS };
 
+  // ── Install Stop hooks ────────────────────────────────────────────────────
+  writeln();
+  writeln('Installing Stop hooks...');
+
+  try {
+    writeStopHook();
+    writeln(`  ${GREEN}✓${RESET} Hook script written to ${STOP_HOOK_PATH.replace(homedir(), '~')}`);
+  } catch (err) {
+    writeln(`  ${YELLOW}⚠${RESET} Failed to write hook script: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  try {
+    installStopHooks(settings);
+    writeln(`  ${GREEN}✓${RESET} Stop + StopFailure hooks registered in settings.json`);
+  } catch (err) {
+    writeln(`  ${YELLOW}⚠${RESET} Failed to register hooks: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
   try {
     writeSettings(settings);
   } catch (err) {
@@ -111,7 +189,7 @@ export async function runSetup(preEnteredKey?: string): Promise<void> {
 
   // ── Done ──────────────────────────────────────────────────────────────────
   writeln();
-  writeln('Ready. Start Radar in a second terminal pane:');
+  writeln('Ready. Restart Claude Code for the Stop hooks to take effect, then:');
   writeln(`  ${BOLD}radar watch${RESET}`);
   writeln(DIM + sep() + RESET);
 }

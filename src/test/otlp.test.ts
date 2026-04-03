@@ -284,6 +284,33 @@ describe('OtlpReceiver', () => {
     assert.ok(collected[0].sessionId.length > 0);
   });
 
+  test('prefers session.id from log record attributes over resource-derived session ID', async () => {
+    const collected: RadarEvent[] = [];
+    const listener = (e: RadarEvent) => collected.push(e);
+    receiver.on('event', listener);
+
+    // Simulates the real Claude Code OTel shape: no resource session.id,
+    // but session.id present as a log record attribute (matching what the Stop hook sends).
+    await postLogs(TEST_PORT, makeLogRecord(
+      'claude_code.user_prompt',
+      [
+        { key: 'prompt.id', value: { stringValue: 'log-attr-sess-001' } },
+        { key: 'session.id', value: { stringValue: 'real-claude-session-uuid' } },
+        { key: 'prompt', value: { stringValue: 'test' } },
+        { key: 'prompt_length', value: { intValue: 4 } },
+      ],
+      // No resource attributes — would produce fallback 'radar-xxxx' session ID
+    ));
+
+    await tick();
+    receiver.off('event', listener);
+
+    const evt = collected.find((e) => e.type === 'user_prompt');
+    assert.ok(evt, 'should emit a user_prompt event');
+    assert.equal(evt.sessionId, 'real-claude-session-uuid',
+      'log-record session.id should take priority over fallback resource-derived ID');
+  });
+
   test('extracts session.id from resource attributes', async () => {
     const collected: RadarEvent[] = [];
     const listener = (e: RadarEvent) => collected.push(e);

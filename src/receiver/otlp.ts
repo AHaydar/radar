@@ -8,6 +8,7 @@ export type RadarEventType =
   | 'tool_result'
   | 'api_request'
   | 'api_error'
+  | 'tool_decision'
   | 'unknown';
 
 export interface BaseEvent {
@@ -47,11 +48,19 @@ export interface ApiErrorEvent extends BaseEvent {
   statusCode?: number;
 }
 
+export interface ToolDecisionEvent extends BaseEvent {
+  type: 'tool_decision';
+  toolName: string;
+  decision: string;
+  source: string;
+}
+
 export type RadarEvent =
   | UserPromptEvent
   | ToolResultEvent
   | ApiRequestEvent
-  | ApiErrorEvent;
+  | ApiErrorEvent
+  | ToolDecisionEvent;
 
 // ─── OTLP JSON shape (minimal) ────────────────────────────────────────────────
 
@@ -134,7 +143,12 @@ function parseLogRecord(record: OtlpLogRecord, sessionId: string): RadarEvent | 
   const attrs = buildAttrMap(record.attributes);
 
   const promptId = getString(attrs, 'prompt.id');
-  const base: BaseEvent = { type: 'unknown', promptId, sessionId, timestampMs };
+  // Claude Code sends session.id as a log-record attribute (not a resource attribute).
+  // Prefer it over the resource-derived sessionId so that the Stop hook's session ID
+  // (which also comes from Claude Code) matches what we store in activeTurns.
+  const recordSessionId = getString(attrs, 'session.id');
+  const effectiveSessionId = recordSessionId || sessionId;
+  const base: BaseEvent = { type: 'unknown', promptId, sessionId: effectiveSessionId, timestampMs };
 
   switch (eventName) {
     case 'claude_code.user_prompt': {
@@ -183,6 +197,17 @@ function parseLogRecord(record: OtlpLogRecord, sessionId: string): RadarEvent | 
       };
       const statusCode = getNumber(attrs, 'status_code');
       if (statusCode) e.statusCode = statusCode;
+      return e;
+    }
+
+    case 'claude_code.tool_decision': {
+      const e: ToolDecisionEvent = {
+        ...base,
+        type: 'tool_decision',
+        toolName: getString(attrs, 'tool_name'),
+        decision: getString(attrs, 'decision'),
+        source: getString(attrs, 'source'),
+      };
       return e;
     }
 
@@ -252,6 +277,11 @@ export class OtlpReceiver extends EventEmitter {
   }
 
   private handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
+    if (req.method === 'POST' && req.url === '/v1/hook/stop') {
+      this.handleStop(req, res);
+      return;
+    }
+
     if (req.method !== 'POST' || req.url !== '/v1/logs') {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Not found' }));
@@ -284,6 +314,33 @@ export class OtlpReceiver extends EventEmitter {
 
     req.on('error', (err) => {
       process.stderr.write(`[radar/otlp] request error: ${String(err)}\n`);
+    });
+  }
+
+  private handleStop(req: http.IncomingMessage, res: http.ServerResponse): void {
+    const chunks: Buffer[] = [];
+
+    req.on('data', (chunk: Buffer) => {
+      chunks.push(chunk);
+    });
+
+    req.on('end', () => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+
+      try {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { sessionId?: string };
+        const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
+        if (sessionId) {
+          this.emit('stop', sessionId);
+        }
+      } catch {
+        // ignore malformed stop payloads
+      }
+    });
+
+    req.on('error', (err) => {
+      process.stderr.write(`[radar/otlp] stop request error: ${String(err)}\n`);
     });
   }
 

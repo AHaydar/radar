@@ -10,8 +10,8 @@ const CYAN = '\x1b[36m';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const LINE_WIDTH = 52;
-const WRAP_WIDTH = 50;
+const LINE_WIDTH = 76;
+const WRAP_WIDTH = 74;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -135,14 +135,17 @@ function printPost(color: string, content: string, sessionLabel?: string): void 
 }
 
 /**
- * Print a post-advisory "aligned" box with a green header.
+ * Print a post-advisory "aligned" one-liner — dim green, no box.
  *
  * Example:
- *   ── POST ── 14:25:38 ────────────────────────────────
- *   ── POST [S1] ── 14:25:38 ────────────────────────────────
+ *   ── POST ── 14:25:38 ── ✓ Aligned ──────────────────────────────────────────
+ *   ── POST [S1] ── 14:25:38 ── ✓ Aligned ──────────────────────────────────────
  */
-export function printPostAligned(summary: string, sessionLabel?: string): void {
-  printPost(GREEN, summary, sessionLabel);
+export function printPostAligned(_summary: string, sessionLabel?: string): void {
+  const time = formatTime(new Date());
+  const sessionPart = sessionLabel ? ` [${sessionLabel}]` : '';
+  const prefix = `── POST${sessionPart} ── ${time} ── ✓ Aligned `;
+  writeln(DIM + GREEN + separator(prefix) + RESET);
 }
 
 /**

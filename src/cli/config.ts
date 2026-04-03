@@ -1,5 +1,5 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
-import { execSync } from 'node:child_process';
+import { execSync, execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -28,9 +28,10 @@ export function readConfig(): RadarConfig {
 
 export function writeConfig(config: RadarConfig): void {
   if (!existsSync(CONFIG_DIR)) {
-    mkdirSync(CONFIG_DIR, { recursive: true });
+    mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
   }
-  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + '\n', 'utf8');
+  // mode 0o600 → readable/writable by owner only; protects the plaintext API key
+  writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
 }
 
 export function configPath(): string {
@@ -51,8 +52,11 @@ export function isOpAvailable(): boolean {
 /** Run `op item create` and return the `op://` reference for the stored key. */
 export function createOpItem(apiKey: string): string {
   const title = 'Radar Anthropic API Key';
-  const raw = execSync(
-    `op item create --category=login --title="${title}" "password=${apiKey}" --format json`,
+  // Use execFileSync (no shell) to avoid shell-injection risks when the key
+  // contains quotes, dollar signs, or other shell metacharacters.
+  const raw = execFileSync(
+    'op',
+    ['item', 'create', '--category=login', `--title=${title}`, `password=${apiKey}`, '--format', 'json'],
     { encoding: 'utf8' },
   );
   const item = JSON.parse(raw) as { title: string; vault: { name: string } };
@@ -61,7 +65,9 @@ export function createOpItem(apiKey: string): string {
 
 /** Read a secret from 1Password by its `op://` reference. */
 export function readOpItem(ref: string): string {
-  return execSync(`op read "${ref}"`, { encoding: 'utf8' }).trim();
+  // Use execFileSync (no shell) to avoid injection if the reference contains
+  // shell metacharacters (e.g. spaces or backticks from user-supplied input).
+  return execFileSync('op', ['read', ref], { encoding: 'utf8' }).trim();
 }
 
 // ─── Key resolution ────────────────────────────────────────────────────────────

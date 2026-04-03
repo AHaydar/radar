@@ -80,7 +80,7 @@ describe('formatter', () => {
       printPostAligned('✓ Response aligned with intent.\n  Edit (2 calls) · 847 tokens · $0.003');
       const plain = stripAnsi(captured);
       assert.ok(plain.includes('POST'), 'should include POST');
-      assert.ok(plain.includes('aligned'), 'should include summary text');
+      assert.ok(plain.includes('Aligned'), 'should include Aligned marker');
       assert.ok(plain.includes('─'), 'should include separator');
     });
   });
