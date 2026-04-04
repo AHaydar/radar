@@ -22,6 +22,8 @@ Do NOT flag:
 - Conversational messages ("thanks", "ok", "sounds good")
 - Read-only or low-stakes requests ("show me", "list", "describe")
 
+If recent conversation history is provided, use it to resolve references like "the same", "it", "the other one", "do that again", "the rest". A prompt that looks vague in isolation may be perfectly clear when prior turns establish what the user is working on. Score based on clarity IN CONTEXT, not in isolation.
+
 Respond with ONLY a JSON object on a single line:
 {"score": <0.0-1.0>, "reason": "<one sentence explaining the ambiguity or why it is clear>"}`;
 
@@ -60,4 +62,4 @@ export const POST_ADVISORY_USER_TEMPLATE: string = `Original prompt: {prompt}
 
 Tool activity: {toolSummary}
 Total cost: {totalCost}
-Total tokens: {totalTokens}`;
+Total tokens: {totalTokens}{responseSummarySection}`;

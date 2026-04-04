@@ -8,6 +8,8 @@ import {
   POST_ADVISORY_USER_TEMPLATE,
 } from './prompts.js';
 import { withTimeout } from '../util/async.js';
+import { buildToolSummary } from '../aggregator/tools.js';
+import { summarizeResponse } from './summarizer.js';
 
 export interface AdvisoryResult {
   text: string;
@@ -55,15 +57,34 @@ export class Advisor {
 
   // Post-advisory: called on turn complete
   async postAdvisory(context: TurnContext): Promise<AdvisoryResult> {
-    const toolSummary = buildToolSummary(context);
+    const toolSummary = buildToolSummary(context.toolResults);
     const totalCost = `$${context.totalCostUsd.toFixed(3)}`;
     const totalTokens = (context.totalInputTokens + context.totalOutputTokens).toLocaleString();
+
+    // Optionally enrich the prompt with a Haiku summary of the assistant's response
+    let responseSummarySection = '';
+    if (context.lastAssistantMessage) {
+      try {
+        const summary = await summarizeResponse(
+          this.client,
+          context.prompt,
+          context.lastAssistantMessage,
+        );
+        if (summary) {
+          responseSummarySection =
+            `\n\n## Claude's Response Summary\n${summary}\n\nConsider whether Claude's response addressed the user's intent.`;
+        }
+      } catch {
+        // Summarization failed — proceed without it (existing behavior)
+      }
+    }
 
     const userMessage = POST_ADVISORY_USER_TEMPLATE
       .replace('{prompt}', context.prompt)
       .replace('{toolSummary}', toolSummary)
       .replace('{totalCost}', totalCost)
-      .replace('{totalTokens}', totalTokens);
+      .replace('{totalTokens}', totalTokens)
+      .replace('{responseSummarySection}', responseSummarySection);
 
     const advisoryPromise = (async (): Promise<AdvisoryResult> => {
       const message = await this.client.messages.create({
@@ -86,52 +107,4 @@ export class Advisor {
 
     return withTimeout(advisoryPromise, ADVISORY_TIMEOUT_MS, POST_ADVISORY_FALLBACK_TIMEOUT);
   }
-}
-
-function buildToolSummary(context: TurnContext): string {
-  const parts: string[] = [];
-
-  // Group tool calls by name, tracking Bash separately
-  const toolCounts = new Map<string, number>();
-  const bashCommands: string[] = [];
-  let bashCallCount = 0;
-
-  for (const result of context.toolResults) {
-    if (result.toolName === 'Bash') {
-      bashCallCount++;
-      if (result.bashCommand) {
-        bashCommands.push(`'${result.bashCommand}'`);
-      }
-    } else {
-      toolCounts.set(result.toolName, (toolCounts.get(result.toolName) ?? 0) + 1);
-    }
-  }
-
-  // Add non-bash tools
-  for (const [toolName, count] of toolCounts.entries()) {
-    parts.push(count === 1 ? toolName : `${toolName} (${count} calls)`);
-  }
-
-  // Add bash summary
-  if (bashCallCount > 0) {
-    if (bashCommands.length > 0) {
-      const bashLabel = bashCommands.length <= 3
-        ? `Bash: ${bashCommands.join(', ')}`
-        : `Bash: ${bashCommands.slice(0, 3).join(', ')} +${bashCommands.length - 3} more`;
-      parts.push(bashLabel);
-    } else {
-      parts.push(`Bash (${bashCallCount} calls)`);
-    }
-  }
-
-  // Token and cost summary
-  const totalTokens = context.totalInputTokens + context.totalOutputTokens;
-  if (totalTokens > 0) {
-    parts.push(`${totalTokens.toLocaleString()} tokens`);
-  }
-  if (context.totalCostUsd > 0) {
-    parts.push(`$${context.totalCostUsd.toFixed(3)}`);
-  }
-
-  return parts.join(' · ') || 'No tools used';
 }

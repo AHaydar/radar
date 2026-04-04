@@ -6,6 +6,7 @@ import type {
   ApiErrorEvent,
   ToolDecisionEvent,
 } from '../receiver/otlp.js';
+import { buildToolSummary } from './tools.js';
 
 export interface ToolResultSummary {
   toolName: string;
@@ -29,6 +30,11 @@ export interface ToolDecisionSummary {
   source: string;
 }
 
+export interface TurnHistoryEntry {
+  prompt: string;
+  toolSummary: string;
+}
+
 export interface SessionSummary {
   sessionId: string;
   label: string;           // "S1", "S2", etc.
@@ -49,6 +55,7 @@ export interface TurnContext {
   apiRequests: ApiRequestSummary[];
   errors: string[];
   toolDecisions: ToolDecisionSummary[];
+  lastAssistantMessage?: string;
   // Computed helpers:
   totalCostUsd: number;
   totalInputTokens: number;
@@ -113,13 +120,15 @@ export class TurnAggregator extends EventEmitter {
   private readonly contexts = new Map<string, InternalTurnContext>();
   // Maps sessionId → promptId for the most recent active turn
   private readonly activeTurns = new Map<string, string>();
-  // Sessions where Stop hook fired before any OTel events arrived
-  private readonly pendingStops = new Set<string>();
+  // Sessions where Stop hook fired before any OTel events arrived.
+  // Maps sessionId → lastAssistantMessage (undefined if not provided).
+  private readonly pendingStops = new Map<string, string | undefined>();
   // Active delayed-completion timers, keyed by sessionId
   private readonly completionTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   private readonly sessions = new Map<string, SessionSummary>();
   private sessionCounter = 0;
+  private readonly turnHistory = new Map<string, TurnHistoryEntry[]>();
 
   getSessions(): SessionSummary[] {
     return [...this.sessions.values()];
@@ -153,7 +162,11 @@ export class TurnAggregator extends EventEmitter {
 
       // If a stop arrived before this turn's OTel events, schedule completion now
       if (this.pendingStops.has(event.sessionId)) {
+        const pendingMsg = this.pendingStops.get(event.sessionId);
         this.pendingStops.delete(event.sessionId);
+        if (pendingMsg) {
+          this.contexts.get(promptId)!.lastAssistantMessage = pendingMsg;
+        }
         this._scheduleDelayedComplete(event.sessionId);
       }
 
@@ -234,7 +247,7 @@ export class TurnAggregator extends EventEmitter {
    * - Stop fires before OTel: stores a pending stop; addEvent will reschedule
    *   once the turn context is created.
    */
-  scheduleCompletion(sessionId: string): void {
+  scheduleCompletion(sessionId: string, lastAssistantMessage?: string): void {
     // Cancel any existing timer for this session
     const existing = this.completionTimers.get(sessionId);
     if (existing !== undefined) {
@@ -245,8 +258,15 @@ export class TurnAggregator extends EventEmitter {
     if (!this.activeTurns.has(sessionId)) {
       // No active turn yet — OTel events haven't arrived.
       // Mark as pending; addEvent will reschedule once the context is created.
-      this.pendingStops.add(sessionId);
+      this.pendingStops.set(sessionId, lastAssistantMessage);
       return;
+    }
+
+    // Store the assistant message on the active turn context
+    const promptId = this.activeTurns.get(sessionId)!;
+    const ctx = this.contexts.get(promptId);
+    if (ctx && lastAssistantMessage) {
+      ctx.lastAssistantMessage = lastAssistantMessage;
     }
 
     this._scheduleDelayedComplete(sessionId);
@@ -282,8 +302,21 @@ export class TurnAggregator extends EventEmitter {
 
     this.emit('turn_complete', buildPublicContext(internal));
 
+    // Update turn history for this session (capped at 3 entries)
+    const history = this.turnHistory.get(sessionId) ?? [];
+    history.push({
+      prompt: internal.prompt,
+      toolSummary: buildToolSummary(internal.toolResults),
+    });
+    if (history.length > 3) history.shift();
+    this.turnHistory.set(sessionId, history);
+
     // Clean up context — turn is done
     this.contexts.delete(promptId);
+  }
+
+  getRecentTurns(sessionId: string): TurnHistoryEntry[] {
+    return this.turnHistory.get(sessionId) ?? [];
   }
 
   getContext(promptId: string): TurnContext | undefined {

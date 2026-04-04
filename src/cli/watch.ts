@@ -1,7 +1,7 @@
 import { OtlpReceiver } from '../receiver/otlp.js';
 import type { RadarEvent } from '../receiver/otlp.js';
 import { TurnAggregator } from '../aggregator/turn.js';
-import type { TurnContext, SessionSummary } from '../aggregator/turn.js';
+import type { TurnContext, SessionSummary, TurnHistoryEntry } from '../aggregator/turn.js';
 import { Classifier } from '../analysis/classifier.js';
 import { Advisor } from '../analysis/advisor.js';
 import {
@@ -11,6 +11,7 @@ import {
   printPostAligned,
   printPostMisaligned,
   printSessionStart,
+  printSuppressedCount,
   printWarning,
   printError,
 } from '../output/formatter.js';
@@ -19,6 +20,19 @@ export interface WatchOptions {
   port?: number;
   scoreThreshold?: number;
   apiKey?: string;
+  verbose?: boolean;
+}
+
+/**
+ * Determine whether an event type should be suppressed in alert-only mode.
+ * Always returns false in verbose mode.
+ */
+export function shouldSuppress(
+  type: 'pre-clear' | 'post-aligned' | 'alert',
+  verbose: boolean,
+): boolean {
+  if (verbose) return false;
+  return type !== 'alert';
 }
 
 function errMsg(err: unknown): string {
@@ -28,6 +42,7 @@ function errMsg(err: unknown): string {
 export async function startWatch(options: WatchOptions = {}): Promise<void> {
   const port = options.port ?? 4820;
   const scoreThreshold = options.scoreThreshold ?? 0.6;
+  const verbose = options.verbose ?? false;
 
   const receiver = new OtlpReceiver(port);
   const aggregator = new TurnAggregator();
@@ -40,10 +55,21 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
   const classifying = new Set<string>();
   // Map sessionId → display label ("S1", "S2", …)
   const sessionLabels = new Map<string, string>();
+  // Count of suppressed clear/aligned events (alert-only mode)
+  let suppressedCount = 0;
+
+  /** Flush the suppressed-events counter before printing any alert line. */
+  function flushSuppressed(): void {
+    if (suppressedCount > 0) {
+      printSuppressedCount(suppressedCount);
+      suppressedCount = 0;
+    }
+  }
 
   // ── Wire: session_start → label tracking + display ────────────────────────
   aggregator.on('session_start', (s: SessionSummary) => {
     sessionLabels.set(s.sessionId, s.label);
+    flushSuppressed();
     printSessionStart(s.label, s.sessionId);
   });
 
@@ -69,7 +95,12 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
       );
     }
 
-    void runPreAdvisory(event.prompt, event.promptId, sessionLabels.get(event.sessionId));
+    void runPreAdvisory(
+      event.prompt,
+      event.promptId,
+      aggregator.getRecentTurns(event.sessionId),
+      sessionLabels.get(event.sessionId),
+    );
   });
 
   receiver.on('error', (err: Error) => {
@@ -80,8 +111,8 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
   // Uses scheduleCompletion (not completeTurn directly) to handle the race
   // between the Stop hook and OTel's export interval (2s): the stop signal
   // often arrives before telemetry events are flushed.
-  receiver.on('stop', (sessionId: string) => {
-    aggregator.scheduleCompletion(sessionId);
+  receiver.on('stop', (sessionId: string, lastAssistantMessage?: string) => {
+    aggregator.scheduleCompletion(sessionId, lastAssistantMessage);
   });
 
   // ── Wire: TurnAggregator → post-advisory ───────────────────────────────────
@@ -90,18 +121,28 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
   });
 
   // ── Pre-advisory pipeline ───────────────────────────────────────────────────
-  async function runPreAdvisory(prompt: string, promptId: string, sessionLabel?: string): Promise<void> {
+  async function runPreAdvisory(
+    prompt: string,
+    promptId: string,
+    history: TurnHistoryEntry[],
+    sessionLabel?: string,
+  ): Promise<void> {
     try {
       if (!prompt) return; // no prompt text — skip silently
 
-      const result = await classifier.classify(prompt);
+      const result = await classifier.classify(prompt, history);
 
       if (result.score < scoreThreshold) {
-        printPreClear(result.score, sessionLabel);
+        if (verbose) {
+          printPreClear(result.score, sessionLabel);
+        } else {
+          suppressedCount++;
+        }
         return;
       }
 
-      // Score >= threshold: escalate to Sonnet
+      // Score >= threshold: flush suppressed count, then escalate to Sonnet
+      flushSuppressed();
       const advisory = await advisor.preAdvisory(prompt, result);
       printPreAdvisory(result.score, advisory.text, sessionLabel);
     } catch (err) {
@@ -121,12 +162,18 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
       const result = await advisor.postAdvisory(ctx);
 
       if (result.aligned === false) {
+        flushSuppressed();
         printPostMisaligned(result.text, sessionLabel);
       } else if (result.aligned === true) {
-        printPostAligned(result.text, sessionLabel);
+        if (verbose) {
+          printPostAligned(result.text, sessionLabel);
+        } else {
+          suppressedCount++;
+        }
       } else {
         // aligned is undefined: timeout, error, or unexpected model format —
         // surface as a warning rather than silently showing a green box.
+        flushSuppressed();
         printWarning(`Post-advisory: ${result.text}`);
       }
     } catch (err) {

@@ -7,6 +7,20 @@ const GREEN = '\x1b[32m';
 const YELLOW = '\x1b[33m';
 const RED = '\x1b[31m';
 const CYAN = '\x1b[36m';
+const MAGENTA = '\x1b[35m';
+const BLUE = '\x1b[34m';
+const WHITE = '\x1b[37m';
+
+const SESSION_COLORS = [CYAN, MAGENTA, GREEN, YELLOW, BLUE, WHITE];
+
+/**
+ * Return the ANSI color code for a session label like "S1", "S2", etc.
+ * Cycles through SESSION_COLORS so that S7 wraps back to S1's color.
+ */
+export function sessionColor(label: string): string {
+  const n = parseInt(label.replace(/\D/g, ''), 10) || 1;
+  return SESSION_COLORS[(n - 1) % SESSION_COLORS.length];
+}
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -82,6 +96,8 @@ function writeln(text = ''): void {
 
 /**
  * Print a "clear" one-liner — dim, no box.
+ * When a session label is provided the whole line is colored with that
+ * session's color; otherwise it falls back to plain dim.
  *
  * Example:
  *   ── PRE ── 14:23:07 ── score: 0.34 ── ✓ Clear ─────
@@ -92,11 +108,14 @@ export function printPreClear(score: number, sessionLabel?: string): void {
   const sessionPart = sessionLabel ? ` [${sessionLabel}]` : '';
   const prefix = `── PRE${sessionPart} ── ${time} ── score: ${score.toFixed(2)} ── ✓ Clear `;
   const line = separator(prefix);
-  writeln(DIM + line + RESET);
+  const color = sessionLabel ? sessionColor(sessionLabel) : '';
+  writeln(DIM + color + line + RESET);
 }
 
 /**
  * Print a pre-advisory warning box with a yellow header.
+ * The [Sn] tag within the header is colored with the session's color;
+ * the rest of the header remains YELLOW + BOLD (alert color takes precedence).
  *
  * Example:
  *   ── PRE ── 14:25:12 ── score: 0.78 ─────────────────
@@ -108,7 +127,17 @@ export function printPreAdvisory(score: number, advisory: string, sessionLabel?:
   const headerPrefix = `── PRE${sessionPart} ── ${time} ── score: ${score.toFixed(2)} `;
   const header = separator(headerPrefix);
 
-  writeln(YELLOW + BOLD + header + RESET);
+  if (sessionLabel) {
+    const sColor = sessionColor(sessionLabel);
+    // Inject session color around [Sn], then restore YELLOW+BOLD for the rest
+    const colored = header.replace(
+      `[${sessionLabel}]`,
+      `${sColor}[${sessionLabel}]${YELLOW + BOLD}`,
+    );
+    writeln(YELLOW + BOLD + colored + RESET);
+  } else {
+    writeln(YELLOW + BOLD + header + RESET);
+  }
 
   const lines = renderAdvisoryLines(advisory);
   for (const line of lines) {
@@ -118,13 +147,26 @@ export function printPreAdvisory(score: number, advisory: string, sessionLabel?:
   writeln(DIM + separator() + RESET);
 }
 
-/** Shared implementation for both post-advisory box variants. */
+/**
+ * Shared implementation for both post-advisory box variants.
+ * For alert lines the [Sn] tag is colored with the session's color while
+ * the rest of the header keeps the caller-supplied alert color.
+ */
 function printPost(color: string, content: string, sessionLabel?: string): void {
   const time = formatTime(new Date());
   const sessionPart = sessionLabel ? ` [${sessionLabel}]` : '';
   const header = separator(`── POST${sessionPart} ── ${time} `);
 
-  writeln(color + BOLD + header + RESET);
+  if (sessionLabel) {
+    const sColor = sessionColor(sessionLabel);
+    const colored = header.replace(
+      `[${sessionLabel}]`,
+      `${sColor}[${sessionLabel}]${color + BOLD}`,
+    );
+    writeln(color + BOLD + colored + RESET);
+  } else {
+    writeln(color + BOLD + header + RESET);
+  }
 
   const lines = renderAdvisoryLines(content);
   for (const line of lines) {
@@ -135,7 +177,8 @@ function printPost(color: string, content: string, sessionLabel?: string): void 
 }
 
 /**
- * Print a post-advisory "aligned" one-liner — dim green, no box.
+ * Print a post-advisory "aligned" one-liner — dim, colored with the session's
+ * color when a label is present, otherwise dim green.
  *
  * Example:
  *   ── POST ── 14:25:38 ── ✓ Aligned ──────────────────────────────────────────
@@ -145,11 +188,13 @@ export function printPostAligned(_summary: string, sessionLabel?: string): void 
   const time = formatTime(new Date());
   const sessionPart = sessionLabel ? ` [${sessionLabel}]` : '';
   const prefix = `── POST${sessionPart} ── ${time} ── ✓ Aligned `;
-  writeln(DIM + GREEN + separator(prefix) + RESET);
+  const color = sessionLabel ? sessionColor(sessionLabel) : GREEN;
+  writeln(DIM + color + separator(prefix) + RESET);
 }
 
 /**
  * Print a post-advisory "misaligned" box with a red header.
+ * The [Sn] tag is colored with the session's color.
  *
  * Example:
  *   ── POST ── 14:31:02 ────────────────────────────────
@@ -160,7 +205,7 @@ export function printPostMisaligned(advisory: string, sessionLabel?: string): vo
 }
 
 /**
- * Print a dim cyan session-connected line.
+ * Print a dim session-connected line colored with the session's color.
  *
  * Example:
  *   ── S1 connected (abcd1234…) ── 14:23:07
@@ -168,7 +213,19 @@ export function printPostMisaligned(advisory: string, sessionLabel?: string): vo
 export function printSessionStart(label: string, sessionId: string): void {
   const time = formatTime(new Date());
   const shortId = sessionId.slice(0, 8);
-  writeln(DIM + CYAN + `── ${label} connected (${shortId}…) ── ${time}` + RESET);
+  writeln(DIM + sessionColor(label) + `── ${label} connected (${shortId}…) ── ${time}` + RESET);
+}
+
+/**
+ * Print a suppressed-events counter line — dim one-liner shown before an alert
+ * when running in alert-only mode (the default).
+ *
+ * Example:
+ *   ... 23 events clear ...
+ *   ... 1 event clear ...
+ */
+export function printSuppressedCount(count: number): void {
+  writeln(DIM + `  ... ${count} event${count === 1 ? '' : 's'} clear ...` + RESET);
 }
 
 /**

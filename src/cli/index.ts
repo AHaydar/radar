@@ -10,7 +10,7 @@ const program = new Command();
 program
   .name('radar')
   .description('Non-blocking intent alignment checker for Claude Code, powered by OpenTelemetry')
-  .version('0.1.0');
+  .version('0.1.4');
 
 program
   .command('watch')
@@ -22,7 +22,8 @@ program
     '0.6',
   )
   .option('-k, --api-key <key>', 'Anthropic API key (overrides all other sources)')
-  .action(async (opts: { port: string; threshold: string; apiKey?: string }) => {
+  .option('-v, --verbose', 'Show all events including clear/aligned (default: alert-only)')
+  .action(async (opts: { port: string; threshold: string; apiKey?: string; verbose?: boolean }) => {
     const port = parseInt(opts.port, 10);
     const scoreThreshold = parseFloat(opts.threshold);
 
@@ -49,7 +50,7 @@ program
       process.exit(1);
     }
 
-    await startWatch({ port, scoreThreshold, apiKey });
+    await startWatch({ port, scoreThreshold, apiKey, verbose: opts.verbose ?? false });
   });
 
 program

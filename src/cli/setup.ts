@@ -16,6 +16,7 @@ const CLAUDE_DIR = join(homedir(), '.claude');
 const SETTINGS_PATH = join(CLAUDE_DIR, 'settings.json');
 const RADAR_HOOKS_DIR = join(homedir(), '.radar', 'hooks');
 const STOP_HOOK_PATH = join(RADAR_HOOKS_DIR, 'stop.sh');
+const EXTRACT_SCRIPT_PATH = join(RADAR_HOOKS_DIR, 'extract-response.py');
 
 const OTEL_VARS: Record<string, string> = {
   CLAUDE_CODE_ENABLE_TELEMETRY: '1',
@@ -73,13 +74,76 @@ function question(rl: ReturnType<typeof createInterface>, prompt: string): Promi
 // ─── Stop hook installation ───────────────────────────────────────────────────
 
 const STOP_HOOK_SCRIPT = `#!/bin/bash
+# radar-hook-v2
 INPUT=$(cat)
 SESSION_ID=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null)
-if [ -n "$SESSION_ID" ]; then
-  curl -s -X POST "http://localhost:\${RADAR_PORT:-4820}/v1/hook/stop" \\
-    -H "Content-Type: application/json" \\
-    -d "{\\"sessionId\\": \\"$SESSION_ID\\"}" &>/dev/null &
+
+if [ -z "$SESSION_ID" ]; then
+  exit 0
 fi
+
+# Brief pause to let Claude Code flush the JSONL transcript
+sleep 0.2
+
+# Locate the transcript file
+TRANSCRIPT=$(find ~/.claude/projects -name "\${SESSION_ID}.jsonl" -type f 2>/dev/null | head -1)
+
+# Extract last assistant response (empty string if not found)
+RESPONSE=""
+if [ -n "$TRANSCRIPT" ]; then
+  RESPONSE=$(python3 ~/.radar/hooks/extract-response.py "$TRANSCRIPT" 2>/dev/null)
+fi
+
+# POST to radar (fire and forget)
+python3 -c "
+import sys, json, urllib.request
+payload = json.dumps({
+    'sessionId': '$SESSION_ID',
+    'lastAssistantMessage': json.loads(sys.argv[1]) if sys.argv[1] else ''
+})
+req = urllib.request.Request(
+    'http://localhost:\${RADAR_PORT:-4820}/v1/hook/stop',
+    data=payload.encode(),
+    headers={'Content-Type': 'application/json'},
+    method='POST'
+)
+try:
+    urllib.request.urlopen(req, timeout=2)
+except:
+    pass
+" "$RESPONSE" &>/dev/null &
+`;
+
+const EXTRACT_SCRIPT_CONTENT = `import sys, json
+
+transcript = sys.argv[1]
+texts = []
+
+with open(transcript) as f:
+    lines = f.readlines()
+
+for line in reversed(lines):
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if obj.get('type') == 'user':
+        break
+    if obj.get('type') == 'assistant':
+        content = obj.get('message', {}).get('content', [])
+        if isinstance(content, list):
+            for block in content:
+                if block.get('type') == 'text':
+                    texts.append(block['text'])
+
+texts.reverse()
+result = '\\n'.join(texts)
+
+# Truncate to 8000 chars
+if len(result) > 8000:
+    result = result[:8000] + '\\n[truncated]'
+
+print(json.dumps(result))
 `;
 
 function writeStopHook(): void {
@@ -88,6 +152,13 @@ function writeStopHook(): void {
   }
   writeFileSync(STOP_HOOK_PATH, STOP_HOOK_SCRIPT, 'utf8');
   chmodSync(STOP_HOOK_PATH, 0o755);
+}
+
+function writeExtractScript(): void {
+  if (!existsSync(RADAR_HOOKS_DIR)) {
+    mkdirSync(RADAR_HOOKS_DIR, { recursive: true });
+  }
+  writeFileSync(EXTRACT_SCRIPT_PATH, EXTRACT_SCRIPT_CONTENT, 'utf8');
 }
 
 function installStopHooks(settings: Record<string, unknown>): void {
@@ -164,6 +235,13 @@ export async function runSetup(preEnteredKey?: string): Promise<void> {
     writeln(`  ${GREEN}✓${RESET} Hook script written to ${STOP_HOOK_PATH.replace(homedir(), '~')}`);
   } catch (err) {
     writeln(`  ${YELLOW}⚠${RESET} Failed to write hook script: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  try {
+    writeExtractScript();
+    writeln(`  ${GREEN}✓${RESET} Extract script written to ${EXTRACT_SCRIPT_PATH.replace(homedir(), '~')}`);
+  } catch (err) {
+    writeln(`  ${YELLOW}⚠${RESET} Failed to write extract script: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   try {

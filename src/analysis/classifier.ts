@@ -1,6 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { CLASSIFIER_SYSTEM_PROMPT } from './prompts.js';
 import { withTimeout } from '../util/async.js';
+import type { TurnHistoryEntry } from '../aggregator/turn.js';
 
 export interface ClassifierResult {
   score: number;   // 0.0 – 1.0
@@ -20,7 +21,7 @@ export class Classifier {
     this.client = new Anthropic({ apiKey: apiKey ?? process.env.ANTHROPIC_API_KEY });
   }
 
-  async classify(prompt: string): Promise<ClassifierResult> {
+  async classify(prompt: string, history?: TurnHistoryEntry[]): Promise<ClassifierResult> {
     const classifyPromise = (async (): Promise<ClassifierResult> => {
       const message = await this.client.messages.create({
         model: 'claude-haiku-4-5',
@@ -29,7 +30,7 @@ export class Classifier {
         messages: [
           {
             role: 'user',
-            content: `User prompt to classify:\n${prompt}`,
+            content: formatClassifierInput(prompt, history),
           },
         ],
       });
@@ -44,6 +45,18 @@ export class Classifier {
 
     return withTimeout(classifyPromise, CLASSIFIER_TIMEOUT_MS, CLASSIFIER_FALLBACK);
   }
+}
+
+function formatClassifierInput(prompt: string, history?: TurnHistoryEntry[]): string {
+  if (!history || history.length === 0) {
+    return `User prompt to classify:\n${prompt}`;
+  }
+
+  const lines = history.map(
+    (h, i) => `Turn ${i + 1}: "${h.prompt}"\n  → ${h.toolSummary}`,
+  );
+
+  return `Recent conversation:\n${lines.join('\n')}\n\nUser prompt to classify:\n${prompt}`;
 }
 
 function parseClassifierResponse(raw: string): ClassifierResult {

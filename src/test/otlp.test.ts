@@ -359,6 +359,129 @@ describe('OtlpReceiver', () => {
     assert.equal(evt.sessionId, '9999');
   });
 
+  // ── Stop hook endpoint tests ───────────────────────────────────────────────
+
+  test('stop payload with sessionId emits stop event', async () => {
+    const stops: Array<[string, string | undefined]> = [];
+    const listener = (sessionId: string, msg?: string) => stops.push([sessionId, msg]);
+    receiver.on('stop', listener);
+
+    const data = JSON.stringify({ sessionId: 'test-session-stop-1' });
+    await new Promise<void>((resolve, reject) => {
+      const req = http.request(
+        {
+          hostname: 'localhost',
+          port: TEST_PORT,
+          path: '/v1/hook/stop',
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
+        },
+        (res) => { res.resume(); resolve(); },
+      );
+      req.on('error', reject);
+      req.write(data);
+      req.end();
+    });
+
+    await tick();
+    receiver.off('stop', listener);
+
+    assert.equal(stops.length, 1);
+    assert.equal(stops[0][0], 'test-session-stop-1');
+    assert.equal(stops[0][1], undefined);
+  });
+
+  test('stop payload with lastAssistantMessage passes it through', async () => {
+    const stops: Array<[string, string | undefined]> = [];
+    const listener = (sessionId: string, msg?: string) => stops.push([sessionId, msg]);
+    receiver.on('stop', listener);
+
+    const data = JSON.stringify({
+      sessionId: 'test-session-stop-2',
+      lastAssistantMessage: 'The assistant refactored the auth module.',
+    });
+    await new Promise<void>((resolve, reject) => {
+      const req = http.request(
+        {
+          hostname: 'localhost',
+          port: TEST_PORT,
+          path: '/v1/hook/stop',
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
+        },
+        (res) => { res.resume(); resolve(); },
+      );
+      req.on('error', reject);
+      req.write(data);
+      req.end();
+    });
+
+    await tick();
+    receiver.off('stop', listener);
+
+    assert.equal(stops.length, 1);
+    assert.equal(stops[0][0], 'test-session-stop-2');
+    assert.equal(stops[0][1], 'The assistant refactored the auth module.');
+  });
+
+  test('stop payload without lastAssistantMessage is backward compatible', async () => {
+    const stops: Array<[string, string | undefined]> = [];
+    const listener = (sessionId: string, msg?: string) => stops.push([sessionId, msg]);
+    receiver.on('stop', listener);
+
+    const data = JSON.stringify({ sessionId: 'test-session-stop-3' });
+    await new Promise<void>((resolve, reject) => {
+      const req = http.request(
+        {
+          hostname: 'localhost',
+          port: TEST_PORT,
+          path: '/v1/hook/stop',
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
+        },
+        (res) => { res.resume(); resolve(); },
+      );
+      req.on('error', reject);
+      req.write(data);
+      req.end();
+    });
+
+    await tick();
+    receiver.off('stop', listener);
+
+    assert.equal(stops.length, 1);
+    assert.equal(stops[0][1], undefined, 'lastAssistantMessage should be undefined when absent');
+  });
+
+  test('stop payload with empty lastAssistantMessage treats it as absent', async () => {
+    const stops: Array<[string, string | undefined]> = [];
+    const listener = (sessionId: string, msg?: string) => stops.push([sessionId, msg]);
+    receiver.on('stop', listener);
+
+    const data = JSON.stringify({ sessionId: 'test-session-stop-4', lastAssistantMessage: '' });
+    await new Promise<void>((resolve, reject) => {
+      const req = http.request(
+        {
+          hostname: 'localhost',
+          port: TEST_PORT,
+          path: '/v1/hook/stop',
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
+        },
+        (res) => { res.resume(); resolve(); },
+      );
+      req.on('error', reject);
+      req.write(data);
+      req.end();
+    });
+
+    await tick();
+    receiver.off('stop', listener);
+
+    assert.equal(stops.length, 1);
+    assert.equal(stops[0][1], undefined, 'empty string lastAssistantMessage should yield undefined');
+  });
+
   test('uses fallback sessionId when no resource attributes', async () => {
     const collected: RadarEvent[] = [];
     const listener = (e: RadarEvent) => collected.push(e);

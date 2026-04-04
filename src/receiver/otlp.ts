@@ -329,10 +329,17 @@ export class OtlpReceiver extends EventEmitter {
       res.end(JSON.stringify({ ok: true }));
 
       try {
-        const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { sessionId?: string };
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+          sessionId?: string;
+          lastAssistantMessage?: string;
+        };
         const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
         if (sessionId) {
-          this.emit('stop', sessionId);
+          const lastAssistantMessage =
+            typeof body.lastAssistantMessage === 'string' && body.lastAssistantMessage
+              ? body.lastAssistantMessage
+              : undefined;
+          this.emit('stop', sessionId, lastAssistantMessage);
         }
       } catch {
         // ignore malformed stop payloads

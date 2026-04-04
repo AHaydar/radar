@@ -64,14 +64,14 @@ Waiting for Claude Code telemetry...
 ─────────────────────────────────────────────────────
 ```
 
-PRE advisories fire within ~2 seconds of your prompt. POST advisories fire after Claude's turn ends, based on what tools it used and what it changed — not Claude's response text, which OTel does not expose.
+PRE advisories fire within ~2 seconds of your prompt. POST advisories fire after Claude's turn ends, based on tool activity, cost, and a Haiku-generated summary of Claude's actual response text.
 
 ## How it works
 
 Claude Code emits structured OTel log events (`user_prompt`, `tool_result`, `api_request`) when telemetry is enabled. Radar runs a lightweight OTLP HTTP receiver on `localhost:4820` that collects these events without touching Claude's execution path.
 
 - **Pre-advisory:** Haiku scores the prompt for ambiguity. If the score is >= 0.6, Sonnet prints a warning with the most likely misinterpretation and a suggested clarification.
-- **Post-advisory:** After no new events for ~5 seconds (turn boundary), Sonnet reviews the accumulated tool activity against the original prompt intent and flags scope drift.
+- **Post-advisory:** After the turn ends, Haiku summarises Claude's actual response text from the JSONL transcript. Sonnet then reviews tool activity, cost, and the response summary against the original intent and flags scope drift or misalignment.
 
 Claude is never blocked or interrupted.
 
@@ -105,6 +105,70 @@ radar watch [options]
   -s, --threshold <score>   Ambiguity score threshold 0.0–1.0 (default: 0.6)
   -k, --api-key <key>       Anthropic API key (overrides all stored sources)
 ```
+
+## Developing locally
+
+### Switch from the global install to a local build
+
+1. Uninstall the global package:
+   ```sh
+   npm uninstall -g radar-cc
+   ```
+2. Install dependencies and build:
+   ```sh
+   npm install
+   npm run build
+   ```
+3. Link the local build as the global `radar` binary:
+   ```sh
+   npm link
+   ```
+   From now on, `radar` points to `dist/cli/index.js` in this repo. Re-run `npm run build` after any code change — no re-linking needed.
+
+### Run setup and tests
+
+4. Run setup to (re-)install the hook scripts:
+   ```sh
+   radar setup
+   ```
+   Confirm you see both of these lines in the output:
+   ```
+   ✓ Hook script written to ~/.radar/hooks/stop.sh
+   ✓ Extract script written to ~/.radar/hooks/extract-response.py
+   ```
+5. Restart Claude Code so the new Stop hook takes effect.
+6. Run the test suite:
+   ```sh
+   npm test
+   ```
+
+### Verify the pipeline end-to-end
+
+7. Check the installed hook version:
+   ```sh
+   head -2 ~/.radar/hooks/stop.sh
+   # should print: # radar-hook-v2
+   ```
+8. Confirm the extract script is present:
+   ```sh
+   ls ~/.radar/hooks/extract-response.py
+   ```
+9. Manually test the extract script against a real transcript:
+   ```sh
+   # Find a session transcript (created after Claude Code runs with OTel enabled)
+   ls ~/.claude/projects/
+   python3 ~/.radar/hooks/extract-response.py \
+     ~/.claude/projects/<folder>/<session-id>.jsonl
+   # Should print a JSON-encoded string of the last assistant response
+   ```
+10. With `radar watch` running, manually POST a stop payload to confirm the endpoint accepts the new field:
+    ```sh
+    curl -s -X POST http://localhost:4820/v1/hook/stop \
+      -H "Content-Type: application/json" \
+      -d '{"sessionId":"test-123","lastAssistantMessage":"I refactored the auth module."}' | cat
+    # Should return: {"ok":true}
+    ```
+11. Send a prompt in Claude Code and watch the `radar watch` pane. The POST advisory should now reflect what Claude actually said, not just which tools it used.
 
 ## License
 
