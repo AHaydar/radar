@@ -23,7 +23,8 @@ program
   )
   .option('-k, --api-key <key>', 'Anthropic API key (overrides all other sources)')
   .option('-v, --verbose', 'Show all events including clear/aligned (default: alert-only)')
-  .action(async (opts: { port: string; threshold: string; apiKey?: string; verbose?: boolean }) => {
+  .option('-d, --debug', 'Print internal pipeline trace: classifier input/output, post gathering, Sonnet input, display timing')
+  .action(async (opts: { port: string; threshold: string; apiKey?: string; verbose?: boolean; debug?: boolean }) => {
     const port = parseInt(opts.port, 10);
     const scoreThreshold = parseFloat(opts.threshold);
 
@@ -50,7 +51,7 @@ program
       process.exit(1);
     }
 
-    await startWatch({ port, scoreThreshold, apiKey, verbose: opts.verbose ?? false });
+    await startWatch({ port, scoreThreshold, apiKey, verbose: opts.verbose ?? false, debug: opts.debug ?? false });
   });
 
 program

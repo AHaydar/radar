@@ -47,7 +47,7 @@ export class Classifier {
   }
 }
 
-function formatClassifierInput(prompt: string, history?: TurnHistoryEntry[]): string {
+export function formatClassifierInput(prompt: string, history?: TurnHistoryEntry[]): string {
   if (!history || history.length === 0) {
     return `User prompt to classify:\n${prompt}`;
   }

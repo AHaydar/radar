@@ -24,6 +24,11 @@ Do NOT flag:
 
 If recent conversation history is provided, use it to resolve references like "the same", "it", "the other one", "do that again", "the rest". A prompt that looks vague in isolation may be perfectly clear when prior turns establish what the user is working on. Score based on clarity IN CONTEXT, not in isolation.
 
+The executor is Claude Code, an AI coding assistant with built-in protocols for common operations. Score against what Claude Code will actually do — not what a generic agent might do. A prompt that sounds vague but maps to a well-defined built-in workflow is NOT ambiguous. Key protocols:
+- Commits: inspects git status/diff/log, selectively stages tracked files by name, writes a descriptive commit message, skips untracked files by default
+- File edits: reads the file before editing, avoids destructive overwrites unless explicitly asked
+- Shell commands: quotes paths with spaces, avoids unnecessary flags, prefers targeted operations over broad ones
+
 Respond with ONLY a JSON object on a single line:
 {"score": <0.0-1.0>, "reason": "<one sentence explaining the ambiguity or why it is clear>"}`;
 

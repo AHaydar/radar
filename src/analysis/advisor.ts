@@ -56,7 +56,10 @@ export class Advisor {
   }
 
   // Post-advisory: called on turn complete
-  async postAdvisory(context: TurnContext): Promise<AdvisoryResult> {
+  async postAdvisory(
+    context: TurnContext,
+    debugLog?: (label: string, body?: string) => void,
+  ): Promise<AdvisoryResult> {
     const toolSummary = buildToolSummary(context.toolResults);
     const totalCost = `$${context.totalCostUsd.toFixed(3)}`;
     const totalTokens = (context.totalInputTokens + context.totalOutputTokens).toLocaleString();
@@ -85,6 +88,9 @@ export class Advisor {
       .replace('{totalCost}', totalCost)
       .replace('{totalTokens}', totalTokens)
       .replace('{responseSummarySection}', responseSummarySection);
+
+    // Point 5: log the exact message being sent to Sonnet for post-advisory
+    debugLog?.('POST input (to Sonnet)', userMessage);
 
     const advisoryPromise = (async (): Promise<AdvisoryResult> => {
       const message = await this.client.messages.create({

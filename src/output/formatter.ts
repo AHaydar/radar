@@ -262,3 +262,25 @@ export function printWarning(message: string): void {
 export function printError(message: string): void {
   writeln(RED + '✗ ' + message + RESET);
 }
+
+/**
+ * Print a debug trace line — dim, prefixed with [dbg].
+ * An optional multi-line body is indented under the label.
+ *
+ * Example (label only):
+ *   [dbg] PRE triggered — promptId=abc123  session=S1
+ *
+ * Example (with body):
+ *   [dbg] CLASSIFIER input
+ *        User prompt to classify:
+ *        commit the changes
+ */
+export function printDebug(label: string, body?: string): void {
+  const INDENT = '     '; // aligns body under '[dbg] '
+  if (body) {
+    const indented = body.split('\n').map((l) => INDENT + l).join('\n');
+    writeln(DIM + '[dbg] ' + label + '\n' + indented + RESET);
+  } else {
+    writeln(DIM + '[dbg] ' + label + RESET);
+  }
+}

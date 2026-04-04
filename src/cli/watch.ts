@@ -2,8 +2,9 @@ import { OtlpReceiver } from '../receiver/otlp.js';
 import type { RadarEvent } from '../receiver/otlp.js';
 import { TurnAggregator } from '../aggregator/turn.js';
 import type { TurnContext, SessionSummary, TurnHistoryEntry } from '../aggregator/turn.js';
-import { Classifier } from '../analysis/classifier.js';
+import { Classifier, formatClassifierInput } from '../analysis/classifier.js';
 import { Advisor } from '../analysis/advisor.js';
+import { buildToolSummary } from '../aggregator/tools.js';
 import {
   printBanner,
   printPreClear,
@@ -14,6 +15,7 @@ import {
   printSuppressedCount,
   printWarning,
   printError,
+  printDebug,
 } from '../output/formatter.js';
 
 export interface WatchOptions {
@@ -21,6 +23,7 @@ export interface WatchOptions {
   scoreThreshold?: number;
   apiKey?: string;
   verbose?: boolean;
+  debug?: boolean;
 }
 
 /**
@@ -43,6 +46,12 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
   const port = options.port ?? 4820;
   const scoreThreshold = options.scoreThreshold ?? 0.6;
   const verbose = options.verbose ?? false;
+  const debug = options.debug ?? false;
+
+  /** Only emit when --debug is active. */
+  function dbg(label: string, body?: string): void {
+    if (debug) printDebug(label, body);
+  }
 
   const receiver = new OtlpReceiver(port);
   const aggregator = new TurnAggregator();
@@ -130,9 +139,20 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
     try {
       if (!prompt) return; // no prompt text — skip silently
 
+      // [1] When the pre-advisory pipeline is triggered
+      const preview = prompt.length > 80 ? prompt.slice(0, 80) + '…' : prompt;
+      dbg(`PRE triggered — promptId=${promptId}  session=${sessionLabel ?? '—'}  prompt: "${preview}"`);
+
+      // [2] What we're sending to Haiku as classifier input
+      dbg('CLASSIFIER input', formatClassifierInput(prompt, history));
+
       const result = await classifier.classify(prompt, history);
 
+      // [3] What Haiku returned
+      dbg(`HAIKU response — score=${result.score.toFixed(2)}  reason: ${result.reason}`);
+
       if (result.score < scoreThreshold) {
+        dbg(`score below threshold (${result.score.toFixed(2)} < ${scoreThreshold.toFixed(2)}) — pre-advisory suppressed`);
         if (verbose) {
           printPreClear(result.score, sessionLabel);
         } else {
@@ -142,6 +162,7 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
       }
 
       // Score >= threshold: flush suppressed count, then escalate to Sonnet
+      dbg(`score above threshold — escalating to Sonnet for pre-advisory text`);
       flushSuppressed();
       const advisory = await advisor.preAdvisory(prompt, result);
       printPreAdvisory(result.score, advisory.text, sessionLabel);
@@ -159,20 +180,35 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
     if (!ctx.prompt) return; // no prompt text — skip silently
 
     try {
-      const result = await advisor.postAdvisory(ctx);
+      // [4] What we gathered from the completed turn
+      const toolSummary = buildToolSummary(ctx.toolResults);
+      const totalTokens = ctx.totalInputTokens + ctx.totalOutputTokens;
+      dbg(
+        `POST gathering — tools: "${toolSummary}" | cost: $${ctx.totalCostUsd.toFixed(3)} | ` +
+        `tokens: ${totalTokens.toLocaleString()} | ` +
+        `assistant msg: ${ctx.lastAssistantMessage ? `yes (${ctx.lastAssistantMessage.length} chars)` : 'no'}`,
+      );
 
+      // [5] What we're sending to Sonnet for post-advisory (logged inside advisor)
+      const result = await advisor.postAdvisory(ctx, debug ? dbg : undefined);
+
+      // [6] When the result is sent to the terminal
       if (result.aligned === false) {
+        dbg(`POST displayed — misaligned → showing red box`);
         flushSuppressed();
         printPostMisaligned(result.text, sessionLabel);
       } else if (result.aligned === true) {
         if (verbose) {
+          dbg(`POST displayed — aligned → showing green line`);
           printPostAligned(result.text, sessionLabel);
         } else {
+          dbg(`POST displayed — aligned, suppressed (alert-only mode)`);
           suppressedCount++;
         }
       } else {
         // aligned is undefined: timeout, error, or unexpected model format —
         // surface as a warning rather than silently showing a green box.
+        dbg(`POST displayed — alignment unclear → showing warning`);
         flushSuppressed();
         printWarning(`Post-advisory: ${result.text}`);
       }
