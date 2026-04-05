@@ -3,7 +3,10 @@ import type { RadarEvent } from '../receiver/otlp.js';
 import { TurnAggregator } from '../aggregator/turn.js';
 import type { TurnContext, SessionSummary, TurnHistoryEntry } from '../aggregator/turn.js';
 import { Classifier, formatClassifierInput } from '../analysis/classifier.js';
+import type { ClassifierResult } from '../analysis/classifier.js';
 import { Advisor } from '../analysis/advisor.js';
+import type { AdvisoryResult } from '../analysis/advisor.js';
+import { appendTurn } from '../output/history.js';
 import { buildToolSummary } from '../aggregator/tools.js';
 import {
   printBanner,
@@ -21,9 +24,12 @@ import {
 export interface WatchOptions {
   port?: number;
   scoreThreshold?: number;
+  postThreshold?: number;      // default: same as scoreThreshold
   apiKey?: string;
   verbose?: boolean;
   debug?: boolean;
+  preAdvisorModel?: string;    // model for pre-advisory
+  postAdvisorModel?: string;   // model for post-advisory
 }
 
 /**
@@ -45,6 +51,7 @@ function errMsg(err: unknown): string {
 export async function startWatch(options: WatchOptions = {}): Promise<void> {
   const port = options.port ?? 4820;
   const scoreThreshold = options.scoreThreshold ?? 0.6;
+  const postThreshold = options.postThreshold ?? scoreThreshold;
   const verbose = options.verbose ?? false;
   const debug = options.debug ?? false;
 
@@ -56,7 +63,7 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
   const receiver = new OtlpReceiver(port);
   const aggregator = new TurnAggregator();
   const classifier = new Classifier(options.apiKey);
-  const advisor = new Advisor(options.apiKey);
+  const advisor = new Advisor({ apiKey: options.apiKey, preModel: options.preAdvisorModel, postModel: options.postAdvisorModel });
 
   // Track whether we've seen any events without prompt content — warn once
   let warnedAboutMissingPrompt = false;
@@ -66,6 +73,9 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
   const sessionLabels = new Map<string, string>();
   // Count of suppressed clear/aligned events (alert-only mode)
   let suppressedCount = 0;
+  // Cache classification + pre-advisory results so they can be written to history
+  // after post-advisory completes. Keyed by promptId, cleaned up in runPostAdvisory.
+  const preAdvisoryCache = new Map<string, { classification: ClassifierResult; preAdvisory: AdvisoryResult | null }>();
 
   /** Flush the suppressed-events counter before printing any alert line. */
   function flushSuppressed(): void {
@@ -147,12 +157,14 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
       dbg('CLASSIFIER input', formatClassifierInput(prompt, history));
 
       const result = await classifier.classify(prompt, history);
+      aggregator.setClassificationScore(promptId, result.score);
 
       // [3] What Haiku returned
       dbg(`HAIKU response — score=${result.score.toFixed(2)}  reason: ${result.reason}`);
 
       if (result.score < scoreThreshold) {
         dbg(`score below threshold (${result.score.toFixed(2)} < ${scoreThreshold.toFixed(2)}) — pre-advisory suppressed`);
+        preAdvisoryCache.set(promptId, { classification: result, preAdvisory: null });
         if (verbose) {
           printPreClear(result.score, sessionLabel);
         } else {
@@ -165,6 +177,7 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
       dbg(`score above threshold — escalating to Sonnet for pre-advisory text`);
       flushSuppressed();
       const advisory = await advisor.preAdvisory(prompt, result);
+      preAdvisoryCache.set(promptId, { classification: result, preAdvisory: advisory });
       printPreAdvisory(result.score, advisory.text, sessionLabel);
     } catch (err) {
       printError(`Pre-advisory failed for prompt ${promptId}: ${errMsg(err)}`);
@@ -179,6 +192,24 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
   async function runPostAdvisory(ctx: TurnContext, sessionLabel?: string): Promise<void> {
     if (!ctx.prompt) return; // no prompt text — skip silently
 
+    if (ctx.classificationScore !== undefined && ctx.classificationScore < postThreshold) {
+      dbg(`POST skipped — score ${ctx.classificationScore.toFixed(2)} below post-threshold ${postThreshold.toFixed(2)}`);
+      if (verbose) {
+        printPostAligned('Below threshold - skipped', sessionLabel, ctx.classificationScore);
+      } else {
+        suppressedCount++;
+      }
+      // Still write to history — pass null for post result
+      const cached = preAdvisoryCache.get(ctx.promptId);
+      preAdvisoryCache.delete(ctx.promptId);
+      try {
+        appendTurn(ctx, cached?.classification ?? null, cached?.preAdvisory ?? null, null);
+      } catch { /* never surface */ }
+      return;
+    }
+
+    let result: AdvisoryResult | null = null;
+
     try {
       // [4] What we gathered from the completed turn
       const toolSummary = buildToolSummary(ctx.toolResults);
@@ -190,7 +221,7 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
       );
 
       // [5] What we're sending to Sonnet for post-advisory (logged inside advisor)
-      const result = await advisor.postAdvisory(ctx, debug ? dbg : undefined);
+      result = await advisor.postAdvisory(ctx, debug ? dbg : undefined);
 
       // [6] When the result is sent to the terminal
       if (result.aligned === false) {
@@ -200,7 +231,7 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
       } else if (result.aligned === true) {
         if (verbose) {
           dbg(`POST displayed — aligned → showing green line`);
-          printPostAligned(result.text, sessionLabel);
+          printPostAligned(result.text, sessionLabel, ctx.classificationScore);
         } else {
           dbg(`POST displayed — aligned, suppressed (alert-only mode)`);
           suppressedCount++;
@@ -214,6 +245,16 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
       }
     } catch (err) {
       printError(`Post-advisory failed for prompt ${ctx.promptId}: ${errMsg(err)}`);
+    } finally {
+      // Append to history regardless of success/failure — fire-and-forget.
+      // Pull cached pre-advisory data (may be absent if prompt was missing).
+      const cached = preAdvisoryCache.get(ctx.promptId);
+      preAdvisoryCache.delete(ctx.promptId);
+      try {
+        appendTurn(ctx, cached?.classification ?? null, cached?.preAdvisory ?? null, result ?? null);
+      } catch {
+        // Never let a history write failure surface to the user.
+      }
     }
   }
 

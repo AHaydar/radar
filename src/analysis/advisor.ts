@@ -24,9 +24,13 @@ const POST_ADVISORY_FALLBACK_ERROR: AdvisoryResult = { text: 'Advisory unavailab
 
 export class Advisor {
   private readonly client: Anthropic;
+  private readonly preModel: string;
+  private readonly postModel: string;
 
-  constructor(apiKey?: string) {
-    this.client = new Anthropic({ apiKey: apiKey ?? process.env.ANTHROPIC_API_KEY });
+  constructor(options: { apiKey?: string; preModel?: string; postModel?: string } = {}) {
+    this.client = new Anthropic({ apiKey: options.apiKey ?? process.env.ANTHROPIC_API_KEY });
+    this.preModel = options.preModel ?? 'claude-haiku-4-5';
+    this.postModel = options.postModel ?? 'claude-haiku-4-5';
   }
 
   // Pre-advisory: called when classifier score >= 0.6
@@ -38,7 +42,7 @@ export class Advisor {
 
     const advisoryPromise = (async (): Promise<AdvisoryResult> => {
       const message = await this.client.messages.create({
-        model: 'claude-sonnet-4-5',
+        model: this.preModel,
         max_tokens: 200,
         system: PRE_ADVISORY_SYSTEM_PROMPT,
         messages: [{ role: 'user', content: userMessage }],
@@ -82,19 +86,24 @@ export class Advisor {
       }
     }
 
+    const scoreSection = context.classificationScore !== undefined
+      ? `\nAmbiguity score: ${context.classificationScore.toFixed(2)}`
+      : '';
+
     const userMessage = POST_ADVISORY_USER_TEMPLATE
       .replace('{prompt}', context.prompt)
       .replace('{toolSummary}', toolSummary)
       .replace('{totalCost}', totalCost)
       .replace('{totalTokens}', totalTokens)
-      .replace('{responseSummarySection}', responseSummarySection);
+      .replace('{responseSummarySection}', responseSummarySection)
+      .replace('{scoreSection}', scoreSection);
 
-    // Point 5: log the exact message being sent to Sonnet for post-advisory
-    debugLog?.('POST input (to Sonnet)', userMessage);
+    // Point 5: log the exact message being sent to advisor for post-advisory
+    debugLog?.('POST input (to advisor)', userMessage);
 
     const advisoryPromise = (async (): Promise<AdvisoryResult> => {
       const message = await this.client.messages.create({
-        model: 'claude-sonnet-4-5',
+        model: this.postModel,
         max_tokens: 300,
         system: POST_ADVISORY_SYSTEM_PROMPT,
         messages: [{ role: 'user', content: userMessage }],

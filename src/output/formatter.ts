@@ -184,10 +184,11 @@ function printPost(color: string, content: string, sessionLabel?: string): void 
  *   ── POST ── 14:25:38 ── ✓ Aligned ──────────────────────────────────────────
  *   ── POST [S1] ── 14:25:38 ── ✓ Aligned ──────────────────────────────────────
  */
-export function printPostAligned(_summary: string, sessionLabel?: string): void {
+export function printPostAligned(_summary: string, sessionLabel?: string, score?: number): void {
   const time = formatTime(new Date());
   const sessionPart = sessionLabel ? ` [${sessionLabel}]` : '';
-  const prefix = `── POST${sessionPart} ── ${time} ── ✓ Aligned `;
+  const scorePart = score !== undefined ? ` ── score: ${score.toFixed(2)}` : '';
+  const prefix = `── POST${sessionPart} ── ${time}${scorePart} ── ✓ Aligned `;
   const color = sessionLabel ? sessionColor(sessionLabel) : GREEN;
   writeln(DIM + color + separator(prefix) + RESET);
 }

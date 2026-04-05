@@ -56,6 +56,7 @@ export interface TurnContext {
   errors: string[];
   toolDecisions: ToolDecisionSummary[];
   lastAssistantMessage?: string;
+  classificationScore?: number;
   // Computed helpers:
   totalCostUsd: number;
   totalInputTokens: number;
@@ -323,5 +324,10 @@ export class TurnAggregator extends EventEmitter {
     const internal = this.contexts.get(promptId);
     if (!internal) return undefined;
     return buildPublicContext(internal);
+  }
+
+  setClassificationScore(promptId: string, score: number): void {
+    const ctx = this.contexts.get(promptId);
+    if (ctx) ctx.classificationScore = score;
   }
 }

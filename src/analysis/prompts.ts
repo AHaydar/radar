@@ -61,10 +61,12 @@ Given the original prompt and a summary of tool activity, determine alignment an
 If aligned: respond with exactly one line starting with "✓" — a brief confirmation — followed by a one-line tools/cost summary.
 If misaligned: respond with a line starting with "✗" describing what went wrong, then a line starting with "→" containing an exact re-prompt suggestion in quotes.
 
+Important: Claude Code performs work through tools, not through its text response. A brief confirmation like "Done" or "Updated X" after Edit, Write, or Bash calls is the normal pattern — do NOT treat it as misalignment. Judge alignment based on whether the tools used match the intent, not on whether the text response contains detailed output.
+
 Format: plain text, no markdown. Maximum 5 lines total.`;
 
 export const POST_ADVISORY_USER_TEMPLATE: string = `Original prompt: {prompt}
 
 Tool activity: {toolSummary}
 Total cost: {totalCost}
-Total tokens: {totalTokens}{responseSummarySection}`;
+Total tokens: {totalTokens}{responseSummarySection}{scoreSection}`;

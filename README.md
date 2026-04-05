@@ -68,10 +68,25 @@ PRE advisories fire within ~2 seconds of your prompt. POST advisories fire after
 
 ## How it works
 
-Claude Code emits structured OTel log events (`user_prompt`, `tool_result`, `api_request`) when telemetry is enabled. Radar runs a lightweight OTLP HTTP receiver on `localhost:4820` that collects these events without touching Claude's execution path.
+**Setup:** `radar watch` starts an HTTP server on port 4820. Claude Code streams OpenTelemetry events to it.
 
-- **Pre-advisory:** Haiku scores the prompt for ambiguity. If the score is >= 0.6, Sonnet prints a warning with the most likely misinterpretation and a suggested clarification.
-- **Post-advisory:** After the turn ends, Haiku summarises Claude's actual response text from the JSONL transcript. Sonnet then reviews tool activity, cost, and the response summary against the original intent and flags scope drift or misalignment.
+**When you submit a prompt:**
+
+1. Claude Code emits a `user_prompt` OTel event → Radar opens a new turn context
+2. Radar immediately calls Haiku to score ambiguity (0–1). Result cached on the turn context
+3. Score < 0.6 → suppress. Score ≥ 0.6 → call Haiku again to generate a warning, print yellow pre-advisory box
+4. Meanwhile, Claude Code is running — tool results and API costs stream in and accumulate on the turn context
+
+**When Claude finishes:**
+
+5. The Stop hook fires, reads Claude Code's JSONL transcript (`~/.claude/projects/**/<session_id>.jsonl`) to extract the last assistant response, POSTs `{ sessionId, lastAssistantMessage }` to Radar
+6. Radar waits 3.5s for straggling OTel events, then closes the turn using the cached ambiguity score from step 2
+7. Score < 0.6 → skip post-advisory entirely (no further Haiku calls)
+8. Score ≥ 0.6 → call Haiku to summarise the assistant response, then call Haiku to judge whether it aligned with the original intent
+9. Aligned → dim one-liner (suppressed in alert-only mode). Misaligned → red box with a re-prompt suggestion
+10. Full turn written to `~/.config/radar/history/YYYY-MM-DD.jsonl` for history and future review
+
+**Next prompt:** the classifier receives the last 3 turns as context, so references like "do the same for the tests" score correctly rather than looking vague in isolation.
 
 Claude is never blocked or interrupted.
 

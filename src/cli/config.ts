@@ -13,6 +13,8 @@ const CONFIG_PATH = join(CONFIG_DIR, 'config.json');
 export interface RadarConfig {
   apiKey?: string;      // plaintext local storage
   apiKeyRef?: string;   // 1Password reference e.g. op://vault/item/field
+  preAdvisorModel?: 'claude-haiku-4-5' | 'claude-sonnet-4-5';  // default: 'claude-haiku-4-5'
+  postAdvisorModel?: 'claude-haiku-4-5' | 'claude-sonnet-4-5'; // default: 'claude-haiku-4-5'
 }
 
 // ─── Read / write ──────────────────────────────────────────────────────────────

@@ -8,7 +8,7 @@ export interface ClassifierResult {
   reason: string;
 }
 
-const CLASSIFIER_TIMEOUT_MS = 3000;
+const CLASSIFIER_TIMEOUT_MS = 8000;
 const CLASSIFIER_FALLBACK: ClassifierResult = {
   score: 0.5,
   reason: 'Classification timed out',
