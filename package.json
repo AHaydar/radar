@@ -1,6 +1,6 @@
 {
   "name": "radar-cc",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Non-blocking intent alignment checker for Claude Code, powered by OpenTelemetry",
   "type": "module",
   "bin": {
