@@ -7,6 +7,9 @@ import type { ClassifierResult } from '../analysis/classifier.js';
 import { Advisor } from '../analysis/advisor.js';
 import type { AdvisoryResult } from '../analysis/advisor.js';
 import { appendTurn } from '../output/history.js';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
 import { buildToolSummary } from '../aggregator/tools.js';
 import {
   printBanner,
@@ -258,13 +261,21 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
     }
   }
 
-  // ── OTel env var check ─────────────────────────────────────────────────────
+  // ── OTel env var check (reads Claude Code's settings.json, not process.env) ─
   const requiredOtelVars = [
     'CLAUDE_CODE_ENABLE_TELEMETRY',
     'OTEL_LOGS_EXPORTER',
     'OTEL_EXPORTER_OTLP_LOGS_ENDPOINT',
   ];
-  const missingVars = requiredOtelVars.filter((v) => !process.env[v]);
+  let settingsEnv: Record<string, string> = {};
+  try {
+    const settingsPath = join(homedir(), '.claude', 'settings.json');
+    const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    settingsEnv = (settings.env as Record<string, string>) ?? {};
+  } catch {
+    // settings.json missing or unreadable — will show the warning below
+  }
+  const missingVars = requiredOtelVars.filter((v) => !settingsEnv[v]);
   if (missingVars.length > 0) {
     printWarning('OTel env vars not configured. Run `radar setup` and restart Claude Code.');
   }
