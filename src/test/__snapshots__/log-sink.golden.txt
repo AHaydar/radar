@@ -1,0 +1,17 @@
+── Radar v0.1.0 ────────────────────────────────────────────────────────────
+Listening on localhost:4820
+Waiting for Claude Code telemetry...
+Set OTEL_LOG_USER_PROMPTS=1 for prompt content analysis.
+────────────────────────────────────────────────────────────────────────────
+── S1 connected (abcd1234…) ── HH:MM:SS
+  ... 3 events clear ...
+── S2 connected (efgh5678…) ── HH:MM:SS
+── PRE [S1] ── HH:MM:SS ── score: 0.82 ─────────────────────────────────────
+This prompt is ambiguous. Try specifying a target file.
+────────────────────────────────────────────────────────────────────────────
+  ... 2 events clear ...
+── POST [S1] ── HH:MM:SS ───────────────────────────────────────────────────
+Scope exceeded: 5 files edited, expected 2
+────────────────────────────────────────────────────────────────────────────
+⚠ OTel env vars not configured. Run `radar setup`.
+✗ Post-advisory failed for prompt abc123: timeout

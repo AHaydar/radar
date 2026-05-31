@@ -1,5 +1,5 @@
 import { OtlpReceiver } from '../receiver/otlp.js';
-import type { RadarEvent } from '../receiver/otlp.js';
+import type { RadarEvent as OtlpEvent } from '../receiver/otlp.js';
 import { TurnAggregator } from '../aggregator/turn.js';
 import type { TurnContext, SessionSummary, TurnHistoryEntry } from '../aggregator/turn.js';
 import { Classifier, formatClassifierInput } from '../analysis/classifier.js';
@@ -11,18 +11,9 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { buildToolSummary } from '../aggregator/tools.js';
-import {
-  printBanner,
-  printPreClear,
-  printPreAdvisory,
-  printPostAligned,
-  printPostMisaligned,
-  printSessionStart,
-  printSuppressedCount,
-  printWarning,
-  printError,
-  printDebug,
-} from '../output/formatter.js';
+import type { Sink } from '../output/sink.js';
+import type { RadarEvent } from '../output/events.js';
+import { LogSink } from '../output/sinks/log.js';
 
 export interface WatchOptions {
   port?: number;
@@ -58,9 +49,19 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
   const verbose = options.verbose ?? false;
   const debug = options.debug ?? false;
 
-  /** Only emit when --debug is active. */
+  // ── Sink setup ─────────────────────────────────────────────────────────────
+  const sinks: Sink[] = [new LogSink({ verbose })];
+
+  /** Dispatch a RadarEvent to all sinks. A faulty sink never kills its siblings. */
+  function emit(e: RadarEvent): void {
+    for (const s of sinks) {
+      try { s.emit(e); } catch { /* never let one sink kill another */ }
+    }
+  }
+
+  /** Only emit debug events when --debug is active. */
   function dbg(label: string, body?: string): void {
-    if (debug) printDebug(label, body);
+    if (debug) emit({ type: 'debug', label, body });
   }
 
   const receiver = new OtlpReceiver(port);
@@ -74,25 +75,14 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
   const classifying = new Set<string>();
   // Map sessionId → display label ("S1", "S2", …)
   const sessionLabels = new Map<string, string>();
-  // Count of suppressed clear/aligned events (alert-only mode)
-  let suppressedCount = 0;
   // Cache classification + pre-advisory results so they can be written to history
   // after post-advisory completes. Keyed by promptId, cleaned up in runPostAdvisory.
   const preAdvisoryCache = new Map<string, { classification: ClassifierResult; preAdvisory: AdvisoryResult | null }>();
 
-  /** Flush the suppressed-events counter before printing any alert line. */
-  function flushSuppressed(): void {
-    if (suppressedCount > 0) {
-      printSuppressedCount(suppressedCount);
-      suppressedCount = 0;
-    }
-  }
-
   // ── Wire: session_start → label tracking + display ────────────────────────
   aggregator.on('session_start', (s: SessionSummary) => {
     sessionLabels.set(s.sessionId, s.label);
-    flushSuppressed();
-    printSessionStart(s.label, s.sessionId);
+    emit({ type: 'session.connected', label: s.label, sessionId: s.sessionId });
   });
 
   // ── Wire: OtlpReceiver → TurnAggregator + classification ───────────────────
@@ -100,7 +90,7 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
   // A single listener handles both jobs in order: aggregation first so that
   // TurnContext exists by the time classification starts, then classification
   // for user_prompt events.
-  receiver.on('event', (event: RadarEvent) => {
+  receiver.on('event', (event: OtlpEvent) => {
     // 1. Always feed the aggregator
     aggregator.addEvent(event);
 
@@ -112,9 +102,10 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
 
     if (!event.prompt && !warnedAboutMissingPrompt) {
       warnedAboutMissingPrompt = true;
-      printWarning(
-        'Prompt content not available. Set OTEL_LOG_USER_PROMPTS=1 to enable intent analysis.',
-      );
+      emit({
+        type: 'warning',
+        message: 'Prompt content not available. Set OTEL_LOG_USER_PROMPTS=1 to enable intent analysis.',
+      });
     }
 
     void runPreAdvisory(
@@ -126,7 +117,7 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
   });
 
   receiver.on('error', (err: Error) => {
-    printError(`OTLP server error: ${err.message}`);
+    emit({ type: 'error', message: `OTLP server error: ${err.message}` });
   });
 
   // ── Wire: Stop hook → turn completion ──────────────────────────────────────
@@ -168,22 +159,17 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
       if (result.score < scoreThreshold) {
         dbg(`score below threshold (${result.score.toFixed(2)} < ${scoreThreshold.toFixed(2)}) — pre-advisory suppressed`);
         preAdvisoryCache.set(promptId, { classification: result, preAdvisory: null });
-        if (verbose) {
-          printPreClear(result.score, sessionLabel);
-        } else {
-          suppressedCount++;
-        }
+        emit({ type: 'pre.clear', label: sessionLabel, score: result.score });
         return;
       }
 
-      // Score >= threshold: flush suppressed count, then escalate to Sonnet
+      // Score >= threshold: escalate to Sonnet for pre-advisory text
       dbg(`score above threshold — escalating to Sonnet for pre-advisory text`);
-      flushSuppressed();
       const advisory = await advisor.preAdvisory(prompt, result);
       preAdvisoryCache.set(promptId, { classification: result, preAdvisory: advisory });
-      printPreAdvisory(result.score, advisory.text, sessionLabel);
+      emit({ type: 'pre.advisory', label: sessionLabel, score: result.score, advisory: advisory.text });
     } catch (err) {
-      printError(`Pre-advisory failed for prompt ${promptId}: ${errMsg(err)}`);
+      emit({ type: 'error', message: `Pre-advisory failed for prompt ${promptId}: ${errMsg(err)}` });
     } finally {
       // Always release the deduplication guard once pre-advisory finishes,
       // whether it succeeded, failed, or was skipped due to missing prompt.
@@ -197,11 +183,7 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
 
     if (ctx.classificationScore !== undefined && ctx.classificationScore < postThreshold) {
       dbg(`POST skipped — score ${ctx.classificationScore.toFixed(2)} below post-threshold ${postThreshold.toFixed(2)}`);
-      if (verbose) {
-        printPostAligned('Below threshold - skipped', sessionLabel, ctx.classificationScore);
-      } else {
-        suppressedCount++;
-      }
+      emit({ type: 'post.aligned', label: sessionLabel, score: ctx.classificationScore, summary: 'Below threshold - skipped' });
       // Still write to history — pass null for post result
       const cached = preAdvisoryCache.get(ctx.promptId);
       preAdvisoryCache.delete(ctx.promptId);
@@ -229,25 +211,20 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
       // [6] When the result is sent to the terminal
       if (result.aligned === false) {
         dbg(`POST displayed — misaligned → showing red box`);
-        flushSuppressed();
-        printPostMisaligned(result.text, sessionLabel);
+        emit({ type: 'post.misaligned', label: sessionLabel, advisory: result.text });
       } else if (result.aligned === true) {
-        if (verbose) {
-          dbg(`POST displayed — aligned → showing green line`);
-          printPostAligned(result.text, sessionLabel, ctx.classificationScore);
-        } else {
-          dbg(`POST displayed — aligned, suppressed (alert-only mode)`);
-          suppressedCount++;
-        }
+        dbg(verbose
+          ? `POST displayed — aligned → showing green line`
+          : `POST displayed — aligned, suppressed (alert-only mode)`);
+        emit({ type: 'post.aligned', label: sessionLabel, score: ctx.classificationScore, summary: result.text });
       } else {
         // aligned is undefined: timeout, error, or unexpected model format —
         // surface as a warning rather than silently showing a green box.
         dbg(`POST displayed — alignment unclear → showing warning`);
-        flushSuppressed();
-        printWarning(`Post-advisory: ${result.text}`);
+        emit({ type: 'warning', message: `Post-advisory: ${result.text}` });
       }
     } catch (err) {
-      printError(`Post-advisory failed for prompt ${ctx.promptId}: ${errMsg(err)}`);
+      emit({ type: 'error', message: `Post-advisory failed for prompt ${ctx.promptId}: ${errMsg(err)}` });
     } finally {
       // Append to history regardless of success/failure — fire-and-forget.
       // Pull cached pre-advisory data (may be absent if prompt was missing).
@@ -277,7 +254,7 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
   }
   const missingVars = requiredOtelVars.filter((v) => !settingsEnv[v]);
   if (missingVars.length > 0) {
-    printWarning('OTel env vars not configured. Run `radar setup` and restart Claude Code.');
+    emit({ type: 'warning', message: 'OTel env vars not configured. Run `radar setup` and restart Claude Code.' });
   }
 
   // ── Start ───────────────────────────────────────────────────────────────────
@@ -286,20 +263,21 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
   } catch (err) {
     const msg = errMsg(err);
     if (msg.includes('EADDRINUSE')) {
-      printError(`Port ${port} is already in use. Use --port <n> to choose a different port.`);
+      emit({ type: 'error', message: `Port ${port} is already in use. Use --port <n> to choose a different port.` });
     } else {
-      printError(`Failed to start OTLP receiver: ${msg}`);
+      emit({ type: 'error', message: `Failed to start OTLP receiver: ${msg}` });
     }
     process.exit(1);
   }
 
-  printBanner(port);
+  emit({ type: 'banner', port });
 
   // ── Graceful shutdown ───────────────────────────────────────────────────────
   async function shutdown(): Promise<void> {
     process.stdout.write('\n');
-    printWarning('Shutting down Radar...');
+    emit({ type: 'warning', message: 'Shutting down Radar...' });
     await receiver.stop();
+    for (const s of sinks) await s.close?.();
     process.exit(0);
   }
 
