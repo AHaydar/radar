@@ -16,5 +16,5 @@ export default defineConfig({
   banner: {
     js: '#!/usr/bin/env node',
   },
-  external: ['@anthropic-ai/sdk'],
+  external: ['@anthropic-ai/sdk', 'ink', 'react'],
 });

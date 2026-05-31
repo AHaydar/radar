@@ -2,6 +2,7 @@ import { OtlpReceiver } from '../receiver/otlp.js';
 import type { RadarEvent as OtlpEvent } from '../receiver/otlp.js';
 import { TurnAggregator } from '../aggregator/turn.js';
 import type { TurnContext, SessionSummary, TurnHistoryEntry } from '../aggregator/turn.js';
+import type { AgentMeta } from '../output/events.js';
 import { Classifier, formatClassifierInput } from '../analysis/classifier.js';
 import type { ClassifierResult } from '../analysis/classifier.js';
 import { Advisor } from '../analysis/advisor.js';
@@ -14,6 +15,9 @@ import { buildToolSummary } from '../aggregator/tools.js';
 import type { Sink } from '../output/sink.js';
 import type { RadarEvent } from '../output/events.js';
 import { LogSink } from '../output/sinks/log.js';
+import { DashboardSink } from '../output/sinks/dashboard/index.js';
+
+export type UiMode = 'scroll' | 'dashboard' | 'auto';
 
 export interface WatchOptions {
   port?: number;
@@ -24,6 +28,7 @@ export interface WatchOptions {
   debug?: boolean;
   preAdvisorModel?: string;    // model for pre-advisory
   postAdvisorModel?: string;   // model for post-advisory
+  ui?: UiMode;                 // output mode: scroll (default), dashboard, auto
 }
 
 /**
@@ -48,9 +53,11 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
   const postThreshold = options.postThreshold ?? scoreThreshold;
   const verbose = options.verbose ?? false;
   const debug = options.debug ?? false;
+  const uiMode: UiMode = options.ui ?? 'scroll';
 
   // ── Sink setup ─────────────────────────────────────────────────────────────
-  const sinks: Sink[] = [new LogSink({ verbose })];
+  const logSink = new LogSink({ verbose });
+  const sinks: Sink[] = [logSink];
 
   /** Dispatch a RadarEvent to all sinks. A faulty sink never kills its siblings. */
   function emit(e: RadarEvent): void {
@@ -79,10 +86,30 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
   // after post-advisory completes. Keyed by promptId, cleaned up in runPostAdvisory.
   const preAdvisoryCache = new Map<string, { classification: ClassifierResult; preAdvisory: AdvisoryResult | null }>();
 
+  /** Build AgentMeta from a session, or undefined if no agent name is set. */
+  function agentFromSession(sessionId: string): AgentMeta | undefined {
+    const session = aggregator.getSession(sessionId);
+    if (!session?.agentDisplayName) return undefined;
+    return {
+      name: session.agentName ?? session.agentDisplayName,
+      displayName: session.agentDisplayName,
+      role: session.agentRole,
+    };
+  }
+
+  // ── Wire: agent metadata hooks → aggregator ────────────────────────────────
+  receiver.on('session_start_hook', (payload: { sessionId: string; agentName?: string; agentDisplayName?: string; agentRole?: string }) => {
+    aggregator.setAgentMetadata(payload.sessionId, payload);
+  });
+
+  receiver.on('agent_meta', (payload: { sessionId: string; agentName?: string; agentDisplayName?: string; agentRole?: string }) => {
+    aggregator.setAgentMetadata(payload.sessionId, payload);
+  });
+
   // ── Wire: session_start → label tracking + display ────────────────────────
   aggregator.on('session_start', (s: SessionSummary) => {
     sessionLabels.set(s.sessionId, s.label);
-    emit({ type: 'session.connected', label: s.label, sessionId: s.sessionId });
+    emit({ type: 'session.connected', label: s.label, sessionId: s.sessionId, agent: agentFromSession(s.sessionId) });
   });
 
   // ── Wire: OtlpReceiver → TurnAggregator + classification ───────────────────
@@ -111,6 +138,7 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
     void runPreAdvisory(
       event.prompt,
       event.promptId,
+      event.sessionId,
       aggregator.getRecentTurns(event.sessionId),
       sessionLabels.get(event.sessionId),
     );
@@ -130,13 +158,14 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
 
   // ── Wire: TurnAggregator → post-advisory ───────────────────────────────────
   aggregator.on('turn_complete', (ctx: TurnContext) => {
-    void runPostAdvisory(ctx, sessionLabels.get(ctx.sessionId));
+    void runPostAdvisory(ctx, ctx.sessionId, sessionLabels.get(ctx.sessionId));
   });
 
   // ── Pre-advisory pipeline ───────────────────────────────────────────────────
   async function runPreAdvisory(
     prompt: string,
     promptId: string,
+    sessionId: string,
     history: TurnHistoryEntry[],
     sessionLabel?: string,
   ): Promise<void> {
@@ -159,7 +188,7 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
       if (result.score < scoreThreshold) {
         dbg(`score below threshold (${result.score.toFixed(2)} < ${scoreThreshold.toFixed(2)}) — pre-advisory suppressed`);
         preAdvisoryCache.set(promptId, { classification: result, preAdvisory: null });
-        emit({ type: 'pre.clear', label: sessionLabel, score: result.score });
+        emit({ type: 'pre.clear', label: sessionLabel, score: result.score, agent: agentFromSession(sessionId) });
         return;
       }
 
@@ -167,7 +196,7 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
       dbg(`score above threshold — escalating to Sonnet for pre-advisory text`);
       const advisory = await advisor.preAdvisory(prompt, result);
       preAdvisoryCache.set(promptId, { classification: result, preAdvisory: advisory });
-      emit({ type: 'pre.advisory', label: sessionLabel, score: result.score, advisory: advisory.text });
+      emit({ type: 'pre.advisory', label: sessionLabel, score: result.score, advisory: advisory.text, agent: agentFromSession(sessionId) });
     } catch (err) {
       emit({ type: 'error', message: `Pre-advisory failed for prompt ${promptId}: ${errMsg(err)}` });
     } finally {
@@ -178,12 +207,14 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
   }
 
   // ── Post-advisory pipeline ──────────────────────────────────────────────────
-  async function runPostAdvisory(ctx: TurnContext, sessionLabel?: string): Promise<void> {
+  async function runPostAdvisory(ctx: TurnContext, sessionId: string, sessionLabel?: string): Promise<void> {
     if (!ctx.prompt) return; // no prompt text — skip silently
+
+    const agent = agentFromSession(sessionId);
 
     if (ctx.classificationScore !== undefined && ctx.classificationScore < postThreshold) {
       dbg(`POST skipped — score ${ctx.classificationScore.toFixed(2)} below post-threshold ${postThreshold.toFixed(2)}`);
-      emit({ type: 'post.aligned', label: sessionLabel, score: ctx.classificationScore, summary: 'Below threshold - skipped' });
+      emit({ type: 'post.aligned', label: sessionLabel, score: ctx.classificationScore, summary: 'Below threshold - skipped', agent });
       // Still write to history — pass null for post result
       const cached = preAdvisoryCache.get(ctx.promptId);
       preAdvisoryCache.delete(ctx.promptId);
@@ -211,12 +242,12 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
       // [6] When the result is sent to the terminal
       if (result.aligned === false) {
         dbg(`POST displayed — misaligned → showing red box`);
-        emit({ type: 'post.misaligned', label: sessionLabel, advisory: result.text });
+        emit({ type: 'post.misaligned', label: sessionLabel, advisory: result.text, agent });
       } else if (result.aligned === true) {
         dbg(verbose
           ? `POST displayed — aligned → showing green line`
           : `POST displayed — aligned, suppressed (alert-only mode)`);
-        emit({ type: 'post.aligned', label: sessionLabel, score: ctx.classificationScore, summary: result.text });
+        emit({ type: 'post.aligned', label: sessionLabel, score: ctx.classificationScore, summary: result.text, agent });
       } else {
         // aligned is undefined: timeout, error, or unexpected model format —
         // surface as a warning rather than silently showing a green box.
@@ -274,11 +305,79 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
 
   // ── Graceful shutdown ───────────────────────────────────────────────────────
   async function shutdown(): Promise<void> {
+    // Restore stdin if in raw mode
+    if (process.stdin.isTTY) {
+      try { process.stdin.setRawMode(false); } catch { /* ignore */ }
+    }
     process.stdout.write('\n');
     emit({ type: 'warning', message: 'Shutting down Radar...' });
     await receiver.stop();
     for (const s of sinks) await s.close?.();
     process.exit(0);
+  }
+
+  // ── Dashboard hotkey toggle ─────────────────────────────────────────────────
+  let dashboardSink: DashboardSink | null = null;
+  let dashboardActive = false;
+
+  function enterDashboard(): void {
+    if (dashboardActive) return;
+    dashboardActive = true;
+    logSink.pause();
+    dashboardSink = new DashboardSink();
+    try {
+      dashboardSink.mount(() => {
+        // Called when user presses q or Ctrl-G inside the dashboard
+        exitDashboard();
+      });
+      sinks.push(dashboardSink);
+    } catch (err) {
+      // Alt-screen safe teardown on mount failure
+      process.stdout.write('\x1b[?1049l');
+      dashboardActive = false;
+      logSink.resume();
+      dashboardSink = null;
+      emit({ type: 'error', message: `Dashboard failed to mount: ${errMsg(err)}` });
+    }
+  }
+
+  function exitDashboard(): void {
+    if (!dashboardActive) return;
+    dashboardActive = false;
+    if (dashboardSink) {
+      dashboardSink.close();
+      const idx = sinks.indexOf(dashboardSink);
+      if (idx !== -1) sinks.splice(idx, 1);
+      dashboardSink = null;
+    }
+    logSink.resume();
+  }
+
+  function toggleDashboard(): void {
+    if (dashboardActive) exitDashboard();
+    else enterDashboard();
+  }
+
+  // ── Stdin raw mode for hotkey detection ────────────────────────────────────
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.setEncoding('utf8');
+
+    process.stdin.on('data', (key: string) => {
+      if (key === '\x07') toggleDashboard(); // Ctrl-G
+      if (key === '\x03') void shutdown();   // Ctrl-C in raw mode
+    });
+  }
+
+  // ── Resolve UI mode ─────────────────────────────────────────────────────────
+  const resolvedUi: 'scroll' | 'dashboard' =
+    uiMode === 'auto'
+      ? (process.stdout.isTTY ? 'dashboard' : 'scroll')
+      : uiMode;
+
+  if (resolvedUi === 'dashboard') {
+    enterDashboard();
   }
 
   process.on('SIGINT', () => void shutdown());

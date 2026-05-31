@@ -16,6 +16,7 @@ const CLAUDE_DIR = join(homedir(), '.claude');
 const SETTINGS_PATH = join(CLAUDE_DIR, 'settings.json');
 const RADAR_HOOKS_DIR = join(homedir(), '.radar', 'hooks');
 const STOP_HOOK_PATH = join(RADAR_HOOKS_DIR, 'stop.sh');
+const SESSION_START_HOOK_PATH = join(RADAR_HOOKS_DIR, 'session-start.sh');
 const EXTRACT_SCRIPT_PATH = join(RADAR_HOOKS_DIR, 'extract-response.py');
 
 const OTEL_VARS: Record<string, string> = {
@@ -74,7 +75,7 @@ function question(rl: ReturnType<typeof createInterface>, prompt: string): Promi
 // ─── Stop hook installation ───────────────────────────────────────────────────
 
 const STOP_HOOK_SCRIPT = `#!/bin/bash
-# radar-hook-v2
+# radar-hook-v3
 INPUT=$(cat)
 SESSION_ID=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null)
 
@@ -96,10 +97,13 @@ fi
 
 # POST to radar (fire and forget)
 python3 -c "
-import sys, json, urllib.request
+import sys, json, urllib.request, os
 payload = json.dumps({
     'sessionId': '$SESSION_ID',
-    'lastAssistantMessage': json.loads(sys.argv[1]) if sys.argv[1] else ''
+    'lastAssistantMessage': json.loads(sys.argv[1]) if sys.argv[1] else '',
+    'agentName': os.environ.get('CLAUDE_AGENT_NAME', ''),
+    'agentDisplayName': os.environ.get('CLAUDE_AGENT_DISPLAY_NAME', ''),
+    'agentRole': os.environ.get('CLAUDE_AGENT_ROLE', ''),
 })
 req = urllib.request.Request(
     'http://localhost:\${RADAR_PORT:-4820}/v1/hook/stop',
@@ -112,6 +116,37 @@ try:
 except:
     pass
 " "$RESPONSE" &>/dev/null &
+`;
+
+const SESSION_START_HOOK_SCRIPT = `#!/bin/bash
+# radar-hook-v3
+INPUT=$(cat)
+SESSION_ID=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.stdin).get('session_id',''))" 2>/dev/null)
+
+if [ -z "$SESSION_ID" ]; then
+  exit 0
+fi
+
+# POST session-start metadata to radar (fire and forget)
+python3 -c "
+import json, urllib.request, os
+payload = json.dumps({
+    'sessionId': '$SESSION_ID',
+    'agentName': os.environ.get('CLAUDE_AGENT_NAME', ''),
+    'agentDisplayName': os.environ.get('CLAUDE_AGENT_DISPLAY_NAME', ''),
+    'agentRole': os.environ.get('CLAUDE_AGENT_ROLE', ''),
+})
+req = urllib.request.Request(
+    'http://localhost:\${RADAR_PORT:-4820}/v1/hook/session-start',
+    data=payload.encode(),
+    headers={'Content-Type': 'application/json'},
+    method='POST'
+)
+try:
+    urllib.request.urlopen(req, timeout=2)
+except:
+    pass
+" &>/dev/null &
 `;
 
 const EXTRACT_SCRIPT_CONTENT = `import sys, json
@@ -154,6 +189,14 @@ function writeStopHook(): void {
   chmodSync(STOP_HOOK_PATH, 0o755);
 }
 
+function writeSessionStartHook(): void {
+  if (!existsSync(RADAR_HOOKS_DIR)) {
+    mkdirSync(RADAR_HOOKS_DIR, { recursive: true });
+  }
+  writeFileSync(SESSION_START_HOOK_PATH, SESSION_START_HOOK_SCRIPT, 'utf8');
+  chmodSync(SESSION_START_HOOK_PATH, 0o755);
+}
+
 function writeExtractScript(): void {
   if (!existsSync(RADAR_HOOKS_DIR)) {
     mkdirSync(RADAR_HOOKS_DIR, { recursive: true });
@@ -161,21 +204,16 @@ function writeExtractScript(): void {
   writeFileSync(EXTRACT_SCRIPT_PATH, EXTRACT_SCRIPT_CONTENT, 'utf8');
 }
 
-function installStopHooks(settings: Record<string, unknown>): void {
+function installHooks(settings: Record<string, unknown>): void {
   const hooks = (settings.hooks as Record<string, unknown[]> | undefined) ?? {};
 
-  const hookEntry = {
-    hooks: [
-      {
-        type: 'command',
-        command: STOP_HOOK_PATH,
-        async: true,
-      },
-    ],
-  };
+  /** Build a hook entry for a given script command path. */
+  function makeEntry(command: string): { hooks: { type: string; command: string; async: boolean }[] } {
+    return { hooks: [{ type: 'command', command, async: true }] };
+  }
 
-  // Helper: append hook entry if not already present (idempotent)
-  function appendHook(hookName: string): void {
+  /** Append a hook entry for `commandPath` under `hookName` if not already present (idempotent). */
+  function appendHook(hookName: string, commandPath: string): void {
     const existing = (hooks[hookName] as unknown[] | undefined) ?? [];
     const alreadyInstalled = existing.some((h) => {
       if (typeof h !== 'object' || h === null) return false;
@@ -185,16 +223,17 @@ function installStopHooks(settings: Record<string, unknown>): void {
         (inner) =>
           typeof inner === 'object' &&
           inner !== null &&
-          (inner as Record<string, unknown>).command === STOP_HOOK_PATH,
+          (inner as Record<string, unknown>).command === commandPath,
       );
     });
     if (!alreadyInstalled) {
-      hooks[hookName] = [...existing, hookEntry];
+      hooks[hookName] = [...existing, makeEntry(commandPath)];
     }
   }
 
-  appendHook('Stop');
-  appendHook('StopFailure');
+  appendHook('Stop', STOP_HOOK_PATH);
+  appendHook('StopFailure', STOP_HOOK_PATH);
+  appendHook('PreToolUse', SESSION_START_HOOK_PATH);
 
   settings.hooks = hooks;
 }
@@ -226,15 +265,22 @@ export async function runSetup(preEnteredKey?: string): Promise<void> {
 
   settings.env = { ...existingEnv, ...OTEL_VARS };
 
-  // ── Install Stop hooks ────────────────────────────────────────────────────
+  // ── Install hooks ─────────────────────────────────────────────────────────
   writeln();
-  writeln('Installing Stop hooks...');
+  writeln('Installing hooks...');
 
   try {
     writeStopHook();
-    writeln(`  ${GREEN}✓${RESET} Hook script written to ${STOP_HOOK_PATH.replace(homedir(), '~')}`);
+    writeln(`  ${GREEN}✓${RESET} Stop hook written to ${STOP_HOOK_PATH.replace(homedir(), '~')}`);
   } catch (err) {
-    writeln(`  ${YELLOW}⚠${RESET} Failed to write hook script: ${err instanceof Error ? err.message : String(err)}`);
+    writeln(`  ${YELLOW}⚠${RESET} Failed to write stop hook: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  try {
+    writeSessionStartHook();
+    writeln(`  ${GREEN}✓${RESET} SessionStart hook written to ${SESSION_START_HOOK_PATH.replace(homedir(), '~')}`);
+  } catch (err) {
+    writeln(`  ${YELLOW}⚠${RESET} Failed to write session-start hook: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   try {
@@ -245,8 +291,8 @@ export async function runSetup(preEnteredKey?: string): Promise<void> {
   }
 
   try {
-    installStopHooks(settings);
-    writeln(`  ${GREEN}✓${RESET} Stop + StopFailure hooks registered in settings.json`);
+    installHooks(settings);
+    writeln(`  ${GREEN}✓${RESET} Stop, StopFailure + PreToolUse hooks registered in settings.json`);
   } catch (err) {
     writeln(`  ${YELLOW}⚠${RESET} Failed to register hooks: ${err instanceof Error ? err.message : String(err)}`);
   }
@@ -267,7 +313,7 @@ export async function runSetup(preEnteredKey?: string): Promise<void> {
 
   // ── Done ──────────────────────────────────────────────────────────────────
   writeln();
-  writeln('Ready. Restart Claude Code for the Stop hooks to take effect, then:');
+  writeln('Ready. Restart Claude Code for the hooks to take effect, then:');
   writeln(`  ${BOLD}radar watch${RESET}`);
   writeln(DIM + sep() + RESET);
 }

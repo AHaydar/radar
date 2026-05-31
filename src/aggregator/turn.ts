@@ -43,6 +43,10 @@ export interface SessionSummary {
   startedAt: number;       // ms since epoch
   lastSeenAt: number;      // ms since epoch
   totalCostUsd: number;    // sum across completed turns
+  // Optional agent metadata — populated by SessionStart or Stop hooks
+  agentName?: string;
+  agentDisplayName?: string;
+  agentRole?: string;
 }
 
 export interface TurnContext {
@@ -130,6 +134,8 @@ export class TurnAggregator extends EventEmitter {
   private readonly sessions = new Map<string, SessionSummary>();
   private sessionCounter = 0;
   private readonly turnHistory = new Map<string, TurnHistoryEntry[]>();
+  // Pending agent metadata for sessions that haven't been created yet
+  private readonly pendingAgentMeta = new Map<string, { agentName?: string; agentDisplayName?: string; agentRole?: string }>();
 
   getSessions(): SessionSummary[] {
     return [...this.sessions.values()];
@@ -173,6 +179,8 @@ export class TurnAggregator extends EventEmitter {
 
       // Session tracking
       if (!this.sessions.has(event.sessionId)) {
+        const pendingMeta = this.pendingAgentMeta.get(event.sessionId);
+        this.pendingAgentMeta.delete(event.sessionId);
         const session: SessionSummary = {
           sessionId: event.sessionId,
           label: `S${++this.sessionCounter}`,
@@ -181,6 +189,7 @@ export class TurnAggregator extends EventEmitter {
           startedAt: Date.now(),
           lastSeenAt: Date.now(),
           totalCostUsd: 0,
+          ...pendingMeta,
         };
         this.sessions.set(event.sessionId, session);
         this.emit('session_start', { ...session });
@@ -329,5 +338,25 @@ export class TurnAggregator extends EventEmitter {
   setClassificationScore(promptId: string, score: number): void {
     const ctx = this.contexts.get(promptId);
     if (ctx) ctx.classificationScore = score;
+  }
+
+  /**
+   * Store agent metadata on a session. If the session exists, updates immediately.
+   * If not, stores in a pending map — applied when the session is first created.
+   */
+  setAgentMetadata(
+    sessionId: string,
+    meta: { agentName?: string; agentDisplayName?: string; agentRole?: string },
+  ): void {
+    const session = this.sessions.get(sessionId);
+    if (session) {
+      if (meta.agentName !== undefined) session.agentName = meta.agentName;
+      if (meta.agentDisplayName !== undefined) session.agentDisplayName = meta.agentDisplayName;
+      if (meta.agentRole !== undefined) session.agentRole = meta.agentRole;
+    } else {
+      // Session not created yet — store pending and apply on first event
+      const existing = this.pendingAgentMeta.get(sessionId) ?? {};
+      this.pendingAgentMeta.set(sessionId, { ...existing, ...meta });
+    }
   }
 }

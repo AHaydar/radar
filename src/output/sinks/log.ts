@@ -23,46 +23,75 @@ import {
  *   (printed as "… N events clear …") immediately before any alert line.
  * - verbose=true: every event is printed; flush still happens before alerts
  *   for consistent ordering.
+ *
+ * pause()/resume() — while the Ink dashboard is active, LogSink is paused.
+ * All events are silently dropped (Ink owns the screen). On resume(), printing
+ * resumes; the scroll buffer shows pre-dashboard content (htop/vim UX).
  */
 export class LogSink implements Sink {
   private suppressed = 0;
+  private paused = false;
 
   constructor(private readonly opts: { verbose: boolean }) {}
 
+  /** Pause output — called when the Ink dashboard becomes active. */
+  pause(): void {
+    this.paused = true;
+  }
+
+  /** Resume output — called when the Ink dashboard exits. */
+  resume(): void {
+    this.paused = false;
+  }
+
   emit(e: RadarEvent): void {
+    if (this.paused) return;
+
     switch (e.type) {
-      case 'pre.clear':
+      case 'pre.clear': {
         if (this.opts.verbose) {
           this.flush();
-          printPreClear(e.score, e.label);
+          // Use agent displayName in the header if available; label drives color fallback
+          const displayLabel = e.agent?.displayName ?? e.label;
+          printPreClear(e.score, displayLabel);
         } else {
           this.suppressed++;
         }
         return;
+      }
 
-      case 'pre.advisory':
+      case 'pre.advisory': {
         this.flush();
-        printPreAdvisory(e.score, e.advisory, e.label);
+        const displayLabel = e.agent?.displayName ?? e.label;
+        printPreAdvisory(e.score, e.advisory, displayLabel);
         return;
+      }
 
-      case 'post.aligned':
+      case 'post.aligned': {
         if (this.opts.verbose) {
           this.flush();
-          printPostAligned(e.summary, e.label, e.score);
+          const displayLabel = e.agent?.displayName ?? e.label;
+          printPostAligned(e.summary, displayLabel, e.score);
         } else {
           this.suppressed++;
         }
         return;
+      }
 
-      case 'post.misaligned':
+      case 'post.misaligned': {
         this.flush();
-        printPostMisaligned(e.advisory, e.label);
+        const displayLabel = e.agent?.displayName ?? e.label;
+        printPostMisaligned(e.advisory, displayLabel);
         return;
+      }
 
-      case 'session.connected':
+      case 'session.connected': {
         this.flush();
-        printSessionStart(e.label, e.sessionId);
+        // Show agent displayName in the connected line when available
+        const displayLabel = e.agent?.displayName ?? e.label;
+        printSessionStart(displayLabel, e.sessionId);
         return;
+      }
 
       case 'banner':
         printBanner(e.port);

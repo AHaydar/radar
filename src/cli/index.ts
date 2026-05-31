@@ -1,5 +1,6 @@
 import { Command } from 'commander';
 import { startWatch } from './watch.js';
+import type { UiMode } from './watch.js';
 import { runSetup } from './setup.js';
 import { startSniff } from './sniff.js';
 import { resolveStoredApiKey, readConfig, writeConfig } from './config.js';
@@ -25,7 +26,8 @@ program
   .option('-v, --verbose', 'Show all events including clear/aligned (default: alert-only)')
   .option('-d, --debug', 'Print internal pipeline trace: classifier input/output, post gathering, advisor input, display timing')
   .option('--post-threshold <score>', 'Ambiguity score threshold for triggering a post-advisory (0.0–1.0, defaults to --threshold)')
-  .action(async (opts: { port: string; threshold: string; apiKey?: string; verbose?: boolean; debug?: boolean; postThreshold?: string }) => {
+  .option('--ui <mode>', 'Output mode: scroll (default), dashboard, auto', 'scroll')
+  .action(async (opts: { port: string; threshold: string; apiKey?: string; verbose?: boolean; debug?: boolean; postThreshold?: string; ui?: string }) => {
     const port = parseInt(opts.port, 10);
     const scoreThreshold = parseFloat(opts.threshold);
 
@@ -45,6 +47,13 @@ program
         printError('--post-threshold must be a number between 0.0 and 1.0');
         process.exit(1);
       }
+    }
+
+    const validUiModes: UiMode[] = ['scroll', 'dashboard', 'auto'];
+    const ui = (opts.ui ?? 'scroll') as UiMode;
+    if (!validUiModes.includes(ui)) {
+      printError(`--ui must be one of: ${validUiModes.join(', ')}`);
+      process.exit(1);
     }
 
     // Resolution order: --api-key flag → ANTHROPIC_API_KEY env → stored config (local or 1Password)
@@ -70,6 +79,7 @@ program
       debug: opts.debug ?? false,
       preAdvisorModel: config.preAdvisorModel,
       postAdvisorModel: config.postAdvisorModel,
+      ui,
     });
   });
 

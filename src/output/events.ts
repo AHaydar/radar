@@ -1,3 +1,10 @@
+/** Optional agent metadata — available when launcher scripts export CLAUDE_AGENT_NAME etc. */
+export interface AgentMeta {
+  name: string;        // 'oracle'
+  displayName: string; // 'Oracle'
+  role?: string;       // 'Architect'
+}
+
 /**
  * RadarEvent — typed discriminated union for all observable events in the
  * watch pipeline. Each variant maps 1-to-1 to a print* function in formatter.ts;
@@ -5,11 +12,11 @@
  */
 export type RadarEvent =
   | { type: 'banner'; port: number }
-  | { type: 'session.connected'; label: string; sessionId: string }
-  | { type: 'pre.clear'; label?: string; score: number }
-  | { type: 'pre.advisory'; label?: string; score: number; advisory: string }
-  | { type: 'post.aligned'; label?: string; score?: number; summary: string }
-  | { type: 'post.misaligned'; label?: string; advisory: string }
+  | { type: 'session.connected'; label: string; sessionId: string; agent?: AgentMeta }
+  | { type: 'pre.clear'; label?: string; score: number; agent?: AgentMeta }
+  | { type: 'pre.advisory'; label?: string; score: number; advisory: string; agent?: AgentMeta }
+  | { type: 'post.aligned'; label?: string; score?: number; summary: string; agent?: AgentMeta }
+  | { type: 'post.misaligned'; label?: string; advisory: string; agent?: AgentMeta }
   | { type: 'warning'; message: string }
   | { type: 'error'; message: string }
   | { type: 'debug'; label: string; body?: string };

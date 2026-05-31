@@ -282,6 +282,11 @@ export class OtlpReceiver extends EventEmitter {
       return;
     }
 
+    if (req.method === 'POST' && req.url === '/v1/hook/session-start') {
+      this.handleSessionStart(req, res);
+      return;
+    }
+
     if (req.method !== 'POST' || req.url !== '/v1/logs') {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Not found' }));
@@ -332,6 +337,9 @@ export class OtlpReceiver extends EventEmitter {
         const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
           sessionId?: string;
           lastAssistantMessage?: string;
+          agentName?: string;
+          agentDisplayName?: string;
+          agentRole?: string;
         };
         const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
         if (sessionId) {
@@ -340,6 +348,19 @@ export class OtlpReceiver extends EventEmitter {
               ? body.lastAssistantMessage
               : undefined;
           this.emit('stop', sessionId, lastAssistantMessage);
+
+          // Emit agent metadata if any agent fields are present
+          const agentName = typeof body.agentName === 'string' ? body.agentName.trim() : '';
+          const agentDisplayName = typeof body.agentDisplayName === 'string' ? body.agentDisplayName.trim() : '';
+          const agentRole = typeof body.agentRole === 'string' ? body.agentRole.trim() : undefined;
+          if (agentName || agentDisplayName) {
+            this.emit('agent_meta', {
+              sessionId,
+              agentName: agentName || undefined,
+              agentDisplayName: agentDisplayName || undefined,
+              agentRole: agentRole || undefined,
+            });
+          }
         }
       } catch {
         // ignore malformed stop payloads
@@ -348,6 +369,46 @@ export class OtlpReceiver extends EventEmitter {
 
     req.on('error', (err) => {
       process.stderr.write(`[radar/otlp] stop request error: ${String(err)}\n`);
+    });
+  }
+
+  private handleSessionStart(req: http.IncomingMessage, res: http.ServerResponse): void {
+    const chunks: Buffer[] = [];
+
+    req.on('data', (chunk: Buffer) => {
+      chunks.push(chunk);
+    });
+
+    req.on('end', () => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+
+      try {
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+          sessionId?: string;
+          agentName?: string;
+          agentDisplayName?: string;
+          agentRole?: string;
+        };
+        const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : '';
+        if (sessionId) {
+          const agentName = typeof body.agentName === 'string' ? body.agentName.trim() : undefined;
+          const agentDisplayName = typeof body.agentDisplayName === 'string' ? body.agentDisplayName.trim() : undefined;
+          const agentRole = typeof body.agentRole === 'string' ? body.agentRole.trim() : undefined;
+          this.emit('session_start_hook', {
+            sessionId,
+            agentName: agentName || undefined,
+            agentDisplayName: agentDisplayName || undefined,
+            agentRole: agentRole || undefined,
+          });
+        }
+      } catch {
+        // ignore malformed session-start payloads
+      }
+    });
+
+    req.on('error', (err) => {
+      process.stderr.write(`[radar/otlp] session-start request error: ${String(err)}\n`);
     });
   }
 
