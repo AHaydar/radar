@@ -17,6 +17,9 @@ export class DashboardSink implements Sink {
   private readonly labelToSessionId = new Map<string, string>();
 
   mount(onExit?: () => void): void {
+    // Enter alt-screen — preserves the scroll buffer so exiting the dashboard
+    // restores the terminal exactly as it was (htop/vim UX).
+    process.stdout.write('\x1b[?1049h');
     try {
       const { unmount } = render(
         <Dashboard
@@ -28,7 +31,7 @@ export class DashboardSink implements Sink {
       );
       this.unmount = unmount;
     } catch (err) {
-      // Ensure alt-screen is exited on crash
+      // render() failed — exit alt-screen before re-throwing
       process.stdout.write('\x1b[?1049l');
       throw err;
     }
@@ -122,6 +125,8 @@ export class DashboardSink implements Sink {
     this.unmount?.();
     this.unmount = null;
     this.dispatch = null;
+    // Exit alt-screen — restores the scroll buffer from before mount() was called
+    process.stdout.write('\x1b[?1049l');
   }
 
   private _getOrCreatePromptId(sessionLabel: string): string {

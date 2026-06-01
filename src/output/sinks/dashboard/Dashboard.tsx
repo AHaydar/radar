@@ -51,9 +51,11 @@ export function Dashboard({ onDispatchReady, onExit }: Props): React.ReactElemen
   }, [copyWarning]);
 
   const handleExit = useCallback(() => {
+    // onExit() calls exitDashboard() → dashboardSink.close() → unmount()
+    // which tears down Ink completely. Calling exit() here after unmount()
+    // would operate on a dead app context, so we let onExit own teardown.
     onExit?.();
-    exit();
-  }, [onExit, exit]);
+  }, [onExit]);
 
   useInput((input, key) => {
     if (input === 'q' || input === '\x07') {

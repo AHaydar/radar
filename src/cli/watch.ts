@@ -332,8 +332,7 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
       });
       sinks.push(dashboardSink);
     } catch (err) {
-      // Alt-screen safe teardown on mount failure
-      process.stdout.write('\x1b[?1049l');
+      // mount() already exited alt-screen on failure
       dashboardActive = false;
       logSink.resume();
       dashboardSink = null;
@@ -345,12 +344,19 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
     if (!dashboardActive) return;
     dashboardActive = false;
     if (dashboardSink) {
-      dashboardSink.close();
+      dashboardSink.close(); // calls unmount() then writes \x1b[?1049l
       const idx = sinks.indexOf(dashboardSink);
       if (idx !== -1) sinks.splice(idx, 1);
       dashboardSink = null;
     }
     logSink.resume();
+    // Ink's unmount() calls stdin.setRawMode(false) during its async teardown.
+    // We defer our re-assert past Ink's cleanup so the hotkey keeps working.
+    if (process.stdin.isTTY) {
+      setTimeout(() => {
+        try { process.stdin.setRawMode(true); } catch { /* ignore if already closed */ }
+      }, 50);
+    }
   }
 
   function toggleDashboard(): void {
