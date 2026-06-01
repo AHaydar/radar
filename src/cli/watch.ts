@@ -250,12 +250,14 @@ export async function startWatch(options: WatchOptions = {}): Promise<void> {
         emit({ type: 'post.aligned', label: sessionLabel, score: ctx.classificationScore, summary: result.text, agent });
       } else {
         // aligned is undefined: timeout, error, or unexpected model format —
-        // surface as a warning rather than silently showing a green box.
+        // surface as a warning for scroll view and resolve the dashboard turn.
         dbg(`POST displayed — alignment unclear → showing warning`);
         emit({ type: 'warning', message: `Post-advisory: ${result.text}` });
+        emit({ type: 'post.error', label: sessionLabel, agent });
       }
     } catch (err) {
       emit({ type: 'error', message: `Post-advisory failed for prompt ${ctx.promptId}: ${errMsg(err)}` });
+      emit({ type: 'post.error', label: sessionLabel, agent });
     } finally {
       // Append to history regardless of success/failure — fire-and-forget.
       // Pull cached pre-advisory data (may be absent if prompt was missing).

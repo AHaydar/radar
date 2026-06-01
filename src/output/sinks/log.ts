@@ -85,6 +85,11 @@ export class LogSink implements Sink {
         return;
       }
 
+      case 'post.error':
+        // Scroll view already shows the 'error' or 'warning' event that
+        // preceded this; post.error is a dashboard-only resolution signal.
+        return;
+
       case 'session.connected': {
         this.flush();
         // Show agent displayName in the connected line when available

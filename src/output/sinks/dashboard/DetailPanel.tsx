@@ -25,6 +25,7 @@ function preGlyph(turn: Turn): { glyph: string; color: string } {
 function postGlyph(turn: Turn): { glyph: string; color: string } {
   if (turn.postResult === 'misaligned') return { glyph: '✗', color: 'red' };
   if (turn.postResult === 'aligned') return { glyph: '✓', color: 'green' };
+  if (turn.postResult === 'error') return { glyph: '?', color: 'yellow' };
   if (turn.postResult === 'pending') return { glyph: '…', color: 'cyan' };
   return { glyph: '·', color: 'gray' };
 }

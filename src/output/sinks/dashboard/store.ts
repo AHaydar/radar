@@ -9,7 +9,7 @@ export interface Turn {
   preScore?: number;
   preResult: 'clear' | 'advisory' | null;
   preAdvisory?: string;
-  postResult: 'aligned' | 'misaligned' | 'pending' | null;
+  postResult: 'aligned' | 'misaligned' | 'error' | 'pending' | null;
   postAdvisory?: string;
   postSummary?: string;
   expanded: boolean;
@@ -42,6 +42,7 @@ export type Action =
   | { type: 'pre_advisory'; sessionId: string; promptId: string; score: number; advisory: string }
   | { type: 'post_aligned'; sessionId: string; promptId: string; summary: string }
   | { type: 'post_misaligned'; sessionId: string; promptId: string; advisory: string }
+  | { type: 'post_error'; sessionId: string; promptId: string }
   | { type: 'session_status'; sessionId: string; status: 'running' | 'idle' }
   | { type: 'toggle_expand'; turnIdx: number }
   | { type: 'nav_session'; delta: number }
@@ -206,6 +207,23 @@ export function dashboardReducer(state: DashboardState, action: Action): Dashboa
         lastEventAt: Date.now(),
         alertCount: s.sessions[idx].alertCount + 1,
       };
+      return {
+        ...s,
+        sessions,
+        streamGlyphs: [...s.streamGlyphs, glyph].slice(-MAX_GLYPHS),
+        lastUpdated: Date.now(),
+      };
+    }
+
+    case 'post_error': {
+      const s = ensureSession(state, action.sessionId);
+      const idx = getSessionIndex(s, action.sessionId);
+      const session = upsertTurn(s.sessions[idx], action.promptId, {
+        postResult: 'error',
+      });
+      const glyph = (session.agentDisplayName ?? session.label).charAt(0) + '?';
+      const sessions = [...s.sessions];
+      sessions[idx] = { ...session, status: 'idle', lastEventAt: Date.now() };
       return {
         ...s,
         sessions,

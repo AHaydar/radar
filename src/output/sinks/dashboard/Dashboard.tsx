@@ -7,7 +7,7 @@ import { DetailPanel, copyToClipboard } from './DetailPanel.js';
 import { StatusStrip } from './StatusStrip.js';
 
 // Version — read from package.json at build time via the module path
-const RADAR_VERSION = '0.1.5';
+const RADAR_VERSION = '0.1.6';
 
 interface Props {
   onDispatchReady?: (dispatch: (action: Action) => void) => void;

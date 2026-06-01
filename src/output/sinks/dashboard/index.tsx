@@ -109,6 +109,15 @@ export class DashboardSink implements Sink {
         return;
       }
 
+      case 'post.error': {
+        if (!e.label) return;
+        const sessionId = this.labelToSessionId.get(e.label) ?? e.label;
+        const promptId = this._getOrCreatePromptId(e.label);
+        this.dispatch({ type: 'post_error', sessionId, promptId });
+        this._clearPromptId(e.label);
+        return;
+      }
+
       // Events we ignore in the dashboard:
       case 'banner':
       case 'warning':

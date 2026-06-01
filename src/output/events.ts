@@ -17,6 +17,7 @@ export type RadarEvent =
   | { type: 'pre.advisory'; label?: string; score: number; advisory: string; agent?: AgentMeta }
   | { type: 'post.aligned'; label?: string; score?: number; summary: string; agent?: AgentMeta }
   | { type: 'post.misaligned'; label?: string; advisory: string; agent?: AgentMeta }
+  | { type: 'post.error'; label?: string; agent?: AgentMeta }
   | { type: 'warning'; message: string }
   | { type: 'error'; message: string }
   | { type: 'debug'; label: string; body?: string };

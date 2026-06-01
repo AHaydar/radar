@@ -14,7 +14,7 @@ npm install -g radar-cc
 radar setup
 ```
 
-`radar setup` writes the required OTel environment variables to `~/.claude/settings.json` and walks you through storing your Anthropic API key — either on local disk or in 1Password. Restart Claude Code after running it.
+`radar setup` writes the required OTel environment variables to `~/.claude/settings.json`, installs the Stop hook, and walks you through storing your Anthropic API key — either on local disk or in 1Password. Restart Claude Code after running it.
 
 You can also pass the key directly to skip the prompt:
 
@@ -32,10 +32,33 @@ radar watch
 
 Send prompts in your Claude Code pane as normal. Radar listens passively on `localhost:4820`.
 
+### Dashboard mode
+
+Press **Ctrl-G** at any time to switch to the TUI dashboard, which shows a live session table and per-turn pre/post results. Press `q` or Ctrl-G again to return to scroll view.
+
+You can also start directly in dashboard mode:
+
+```sh
+radar watch --ui=dashboard
+```
+
+Dashboard controls:
+
+| Key | Action |
+|---|---|
+| `↑` / `↓` | Move focus between sessions |
+| `←` / `→` | Scroll through turns for the focused session |
+| `Enter` | Expand / collapse the focused turn |
+| `c` | Copy focused turn's advisory to clipboard |
+| `q` / Ctrl-G | Exit dashboard, restore scroll view |
+| `1`–`9` | Jump directly to session by number |
+
 ## Output
 
+### Scroll mode
+
 ```
-── Radar v0.1.0 ─────────────────────────────────────
+── Radar v0.1.6 ─────────────────────────────────────
 Listening on localhost:4820
 Waiting for Claude Code telemetry...
 ─────────────────────────────────────────────────────
@@ -64,29 +87,32 @@ Waiting for Claude Code telemetry...
 ─────────────────────────────────────────────────────
 ```
 
-PRE advisories fire within ~2 seconds of your prompt. POST advisories fire after Claude's turn ends, based on tool activity, cost, and a Haiku-generated summary of Claude's actual response text.
+PRE advisories fire within ~2 seconds of your prompt. POST advisories fire after Claude's turn ends, based on tool activity, cost, and Claude's actual response text.
 
 ## How it works
 
-**Setup:** `radar watch` starts an HTTP server on port 4820. Claude Code streams OpenTelemetry events to it.
+**Setup:** `radar setup` writes OTel env vars to `~/.claude/settings.json` and installs two hook scripts:
+
+- **Stop hook** (`~/.radar/hooks/stop.sh`) — fires after every Claude turn; reads the session transcript to extract the last assistant response and POSTs it to Radar
+- **SessionStart hook** (`~/.radar/hooks/session-start.sh`) — fires on first tool use; registers the session with Radar
 
 **When you submit a prompt:**
 
 1. Claude Code emits a `user_prompt` OTel event → Radar opens a new turn context
-2. Radar immediately calls Haiku to score ambiguity (0–1). Result cached on the turn context
-3. Score < 0.6 → suppress. Score ≥ 0.6 → call Haiku again to generate a warning, print yellow pre-advisory box
-4. Meanwhile, Claude Code is running — tool results and API costs stream in and accumulate on the turn context
+2. Radar immediately calls Haiku to score ambiguity (0–1)
+3. Score < 0.6 → suppress (one-liner in verbose mode). Score ≥ 0.6 → call Sonnet to generate a warning, print yellow pre-advisory
+4. Meanwhile, Claude Code runs — `tool_result` and `api_request` OTel events accumulate on the turn context
 
 **When Claude finishes:**
 
-5. The Stop hook fires, reads Claude Code's JSONL transcript (`~/.claude/projects/**/<session_id>.jsonl`) to extract the last assistant response, POSTs `{ sessionId, lastAssistantMessage }` to Radar
-6. Radar waits 3.5s for straggling OTel events, then closes the turn using the cached ambiguity score from step 2
-7. Score < 0.6 → skip post-advisory entirely (no further Haiku calls)
-8. Score ≥ 0.6 → call Haiku to summarise the assistant response, then call Haiku to judge whether it aligned with the original intent
+5. The Stop hook fires, extracts the last assistant response from the JSONL transcript, and POSTs `{ sessionId, lastAssistantMessage }` to Radar
+6. Radar waits 3.5s for straggling OTel events, then closes the turn
+7. Score < 0.6 → skip post-advisory entirely (no further API calls)
+8. Score ≥ 0.6 → call Sonnet to judge whether Claude stayed on target, using the accumulated tool activity and assistant response text
 9. Aligned → dim one-liner (suppressed in alert-only mode). Misaligned → red box with a re-prompt suggestion
-10. Full turn written to `~/.config/radar/history/YYYY-MM-DD.jsonl` for history and future review
+10. Full turn written to `~/.config/radar/history/YYYY-MM-DD.jsonl`
 
-**Next prompt:** the classifier receives the last 3 turns as context, so references like "do the same for the tests" score correctly rather than looking vague in isolation.
+**Context:** the classifier receives the last 3 completed turns as context, so follow-up prompts like "do the same for the tests" score correctly rather than looking vague in isolation.
 
 Claude is never blocked or interrupted.
 
@@ -104,86 +130,64 @@ Claude is never blocked or interrupted.
 
 `OTEL_LOG_USER_PROMPTS=1` is required for prompt content analysis. Without it, Radar can detect turn boundaries but cannot analyze intent.
 
-These are written to the `env` block in `~/.claude/settings.json`. If Radar is not running, Claude Code silently ignores them.
-
 ## Options
 
 ```
 radar setup [options]
 
-  -k, --api-key <key>       API key to store (skips the interactive prompt)
+  -k, --api-key <key>           API key to store (skips the interactive prompt)
 
 radar watch [options]
 
-  -p, --port <number>       OTLP listener port (default: 4820)
-  -t, --timeout <ms>        Turn boundary silence window (default: 5000)
-  -s, --threshold <score>   Ambiguity score threshold 0.0–1.0 (default: 0.6)
-  -k, --api-key <key>       Anthropic API key (overrides all stored sources)
+  -p, --port <number>           OTLP listener port (default: 4820)
+  -s, --threshold <score>       Ambiguity score threshold for pre-advisory, 0.0–1.0 (default: 0.6)
+      --post-threshold <score>  Threshold for post-advisory (defaults to --threshold)
+      --ui <mode>               Output mode: scroll (default), dashboard, auto
+  -v, --verbose                 Show all events including clear/aligned (default: alert-only)
+  -d, --debug                   Print internal pipeline trace
+  -k, --api-key <key>           Anthropic API key (overrides all stored sources)
 ```
+
+## Agent name surfacing
+
+When running multiple Claude Code instances (e.g. a FleetView multi-agent setup), you can label each session by exporting env vars before launching Claude:
+
+```sh
+export CLAUDE_AGENT_NAME=oracle
+export CLAUDE_AGENT_DISPLAY_NAME=Oracle
+claude  # this session appears as "Oracle" in the dashboard
+```
+
+Without these vars, sessions are labelled `S1`, `S2`, etc.
 
 ## Developing locally
 
-### Switch from the global install to a local build
-
-1. Uninstall the global package:
-   ```sh
-   npm uninstall -g radar-cc
-   ```
-2. Install dependencies and build:
+1. Build and link the local binary:
    ```sh
    npm install
    npm run build
-   ```
-3. Link the local build as the global `radar` binary:
-   ```sh
    npm link
    ```
-   From now on, `radar` points to `dist/cli/index.js` in this repo. Re-run `npm run build` after any code change — no re-linking needed.
+   From now on, `radar` points to `dist/cli/index.js`. Re-run `npm run build` after code changes — no re-linking needed.
 
-### Run setup and tests
-
-4. Run setup to (re-)install the hook scripts:
+2. Re-run setup to install updated hook scripts:
    ```sh
    radar setup
    ```
-   Confirm you see both of these lines in the output:
-   ```
-   ✓ Hook script written to ~/.radar/hooks/stop.sh
-   ✓ Extract script written to ~/.radar/hooks/extract-response.py
-   ```
-5. Restart Claude Code so the new Stop hook takes effect.
-6. Run the test suite:
+
+3. Restart Claude Code so the new hooks take effect.
+
+4. Run the test suite:
    ```sh
    npm test
    ```
 
-### Verify the pipeline end-to-end
-
-7. Check the installed hook version:
+5. To smoke test the full pipeline, build and install globally:
    ```sh
-   head -2 ~/.radar/hooks/stop.sh
-   # should print: # radar-hook-v2
+   npm run build && npm install -g .
+   radar --version
    ```
-8. Confirm the extract script is present:
-   ```sh
-   ls ~/.radar/hooks/extract-response.py
-   ```
-9. Manually test the extract script against a real transcript:
-   ```sh
-   # Find a session transcript (created after Claude Code runs with OTel enabled)
-   ls ~/.claude/projects/
-   python3 ~/.radar/hooks/extract-response.py \
-     ~/.claude/projects/<folder>/<session-id>.jsonl
-   # Should print a JSON-encoded string of the last assistant response
-   ```
-10. With `radar watch` running, manually POST a stop payload to confirm the endpoint accepts the new field:
-    ```sh
-    curl -s -X POST http://localhost:4820/v1/hook/stop \
-      -H "Content-Type: application/json" \
-      -d '{"sessionId":"test-123","lastAssistantMessage":"I refactored the auth module."}' | cat
-    # Should return: {"ok":true}
-    ```
-11. Send a prompt in Claude Code and watch the `radar watch` pane. The POST advisory should now reflect what Claude actually said, not just which tools it used.
+   See `SMOKE-TEST.md` for the full checklist.
 
 ## License
 

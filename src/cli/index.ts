@@ -11,7 +11,7 @@ const program = new Command();
 program
   .name('radar')
   .description('Non-blocking intent alignment checker for Claude Code, powered by OpenTelemetry')
-  .version('0.1.5');
+  .version('0.1.6');
 
 program
   .command('watch')

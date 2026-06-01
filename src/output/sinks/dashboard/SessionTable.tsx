@@ -13,6 +13,7 @@ function statusGlyph(session: Session): string {
   const lastTurn = session.turns[0];
   if (!lastTurn) return '●';
   if (lastTurn.postResult === 'misaligned') return '✗';
+  if (lastTurn.postResult === 'error') return '?';
   if (lastTurn.preResult === 'advisory') return '⚠';
   if (lastTurn.postResult === 'aligned') return '✓';
   return '●';
@@ -23,6 +24,7 @@ function statusLabel(session: Session): string {
   const lastTurn = session.turns[0];
   if (!lastTurn) return 'idle';
   if (lastTurn.postResult === 'misaligned') return 'misaligned';
+  if (lastTurn.postResult === 'error') return 'error';
   if (lastTurn.preResult === 'advisory') return 'advisory';
   if (lastTurn.postResult === 'aligned') return 'aligned';
   return 'idle';
@@ -33,6 +35,7 @@ function statusColor(session: Session): string {
   const lastTurn = session.turns[0];
   if (!lastTurn) return 'gray';
   if (lastTurn.postResult === 'misaligned') return 'red';
+  if (lastTurn.postResult === 'error') return 'yellow';
   if (lastTurn.preResult === 'advisory') return 'yellow';
   if (lastTurn.postResult === 'aligned') return 'green';
   return 'gray';
